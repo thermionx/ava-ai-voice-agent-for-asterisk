@@ -6785,8 +6785,19 @@ class Engine:
             ready_to_bridge=bool(action.get("ready_to_bridge")),
         )
 
-        if action.get("ready_to_bridge"):
-            await self._finalize_predial_transfer_bridge(session, channel_id)
+        # Single-owner predial state machine:
+        #
+        # The answer event ONLY records that the household destination answered.
+        # finalize_predial_transfer() exclusively owns announcement, liveness
+        # validation, bridging, and caller approval.  Keeping those operations
+        # out of the asynchronous answer event eliminates the competing timing
+        # paths that previously caused duplicate or missing announcements.
+        logger.info(
+            "Predial answer recorded; finalize loop owns announcement and bridge",
+            call_id=caller_id,
+            channel_id=channel_id,
+            ready_to_bridge=bool(action.get("ready_to_bridge")),
+        )
 
     async def finalize_predial_transfer(self, context: "ToolExecutionContext", action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Called after caller-facing transfer audio drains; bridge an answered predial leg."""
@@ -6840,6 +6851,300 @@ class Engine:
                     "strategy": "predial_then_bridge",
                 }
             if predial_channel_id and current.get("answered"):
+                # This is the single owner of the answered predial path.
+                # The answer event records state only; all private announcement,
+                # bridge, and caller-approval work happens here.
+                try:
+                    latest_action = dict(
+                        getattr(session, "current_action", None) or {}
+                    )
+
+                    if not latest_action.get("private_announcement_played"):
+                        # Claim this announcement synchronously before any TTS
+                        # or identity-extraction awaits, preventing replay.
+                        latest_action["private_announcement_played"] = True
+                        session.current_action = latest_action
+                        await self._save_session(session)
+
+                        spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(
+                            session
+                        )
+                        spoken_business_name = await self._operator_zero_extract_spoken_business_name(
+                            session
+                        )
+
+                        if spoken_caller_name:
+                            session.caller_name = spoken_caller_name
+                            await self._save_session(session)
+
+                        caller_name = str(
+                            spoken_caller_name
+                            or getattr(session, "caller_name", "")
+                            or ""
+                        ).strip().rstrip(".,;:!?")
+
+                        business_name = str(
+                            spoken_business_name or ""
+                        ).strip().rstrip(".,;:!?")
+
+                        # Also consult Operator Zero memory. This lets the
+                        # announcement use an identity learned on an earlier
+                        # accepted call even if the live session lacks it.
+                        try:
+                            import json as _json
+                            import urllib.parse as _urllib_parse
+                            import urllib.request as _urllib_request
+
+                            caller_number = str(
+                                getattr(session, "caller_number", "") or ""
+                            ).strip()
+
+                            if caller_number:
+                                import os as _os
+
+                                memory_base_url = str(
+                                    _os.environ.get(
+                                        "OPERATOR_ZERO_MEMORY_URL",
+                                        "http://192.168.1.40:8790",
+                                    )
+                                    or "http://192.168.1.40:8790"
+                                ).rstrip("/")
+
+                                lookup_url = (
+                                    memory_base_url
+                                    + "/caller?phone="
+                                    + _urllib_parse.quote(caller_number)
+                                )
+
+                                def _lookup_caller_identity():
+                                    with _urllib_request.urlopen(
+                                        lookup_url,
+                                        timeout=2.0,
+                                    ) as response:
+                                        return _json.loads(
+                                            response.read().decode("utf-8")
+                                        )
+
+                                memory_identity = await asyncio.to_thread(
+                                    _lookup_caller_identity
+                                )
+
+                                if not caller_name:
+                                    caller_name = str(
+                                        memory_identity.get("trusted_name") or ""
+                                    ).strip().rstrip(".,;:!?")
+
+                                if not business_name:
+                                    business_name = str(
+                                        memory_identity.get("business_name") or ""
+                                    ).strip().rstrip(".,;:!?")
+
+                                logger.info(
+                                    "Operator Zero predial stored caller identity",
+                                    call_id=call_id,
+                                    caller_name=caller_name or None,
+                                    business_name=business_name or None,
+                                )
+
+                        except Exception:
+                            logger.debug(
+                                "Operator Zero predial stored identity lookup failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+
+                        # Prefer identity explicitly supplied by the AI with
+                        # blind_transfer. OpenAI may understand the caller
+                        # correctly even when no input transcript is emitted.
+                        try:
+                            transfer_payload = (
+                                action.get("payload")
+                                if isinstance(action, dict)
+                                and isinstance(action.get("payload"), dict)
+                                else {}
+                            )
+                            transfer_identity = (
+                                transfer_payload.get("operator_zero")
+                                if isinstance(
+                                    transfer_payload.get("operator_zero"),
+                                    dict,
+                                )
+                                else {}
+                            )
+
+                            latest_for_identity = (
+                                await self.session_store.get_by_call_id(call_id)
+                                or session
+                            )
+                            latest_identity_action = dict(
+                                getattr(
+                                    latest_for_identity,
+                                    "current_action",
+                                    None,
+                                )
+                                or {}
+                            )
+
+                            supplied_name = str(
+                                transfer_identity.get("caller_name")
+                                or latest_identity_action.get("caller_name")
+                                or ""
+                            ).strip()
+
+                            supplied_business = str(
+                                transfer_identity.get("company")
+                                or latest_identity_action.get("business_name")
+                                or ""
+                            ).strip()
+
+                            if supplied_name:
+                                caller_name = supplied_name
+
+                            if supplied_business:
+                                business_name = supplied_business
+
+                            if supplied_name or supplied_business:
+                                logger.info(
+                                    "Operator Zero predial using transfer-supplied identity",
+                                    call_id=call_id,
+                                    caller_name=caller_name or None,
+                                    business_name=business_name or None,
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Operator Zero transfer-supplied identity lookup failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+
+                        if caller_name and business_name:
+                            announcement_identity = (
+                                f"{caller_name} from {business_name}"
+                            )
+                            management_identity = caller_name
+                        elif caller_name:
+                            announcement_identity = caller_name
+                            management_identity = caller_name
+                        elif business_name:
+                            announcement_identity = business_name
+                            management_identity = business_name
+                        else:
+                            announcement_identity = "The caller"
+                            management_identity = "the caller"
+
+                        try:
+                            previous_acceptance_count = int(
+                                (memory_identity or {}).get(
+                                    "acceptance_count",
+                                    0,
+                                )
+                                or 0
+                            )
+                        except Exception:
+                            previous_acceptance_count = 0
+
+                        first_admission = previous_acceptance_count == 0
+
+                        announcement_text = f"{announcement_identity} is on the line."
+
+                        logger.info(
+                            "Operator Zero predial finalize private announcement",
+                            call_id=call_id,
+                            caller_name=caller_name or None,
+                            business_name=business_name or None,
+                            announcement_identity=announcement_identity,
+                            first_admission=first_admission,
+                            previous_acceptance_count=previous_acceptance_count,
+                            destination_channel=predial_channel_id,
+                            announcement=announcement_text,
+                        )
+
+                        announcement_audio = None
+
+                        try:
+                            announcement_cache = getattr(
+                                self,
+                                "_operator_zero_predial_announcement_cache",
+                                None,
+                            )
+                            cached_announcement = (
+                                announcement_cache.pop(call_id, None)
+                                if isinstance(announcement_cache, dict)
+                                else None
+                            )
+
+                            if (
+                                isinstance(cached_announcement, dict)
+                                and cached_announcement.get("text")
+                                == announcement_text
+                                and cached_announcement.get("audio")
+                            ):
+                                announcement_audio = cached_announcement["audio"]
+
+                                logger.info(
+                                    "Operator Zero using predial announcement prepared while ringing",
+                                    call_id=call_id,
+                                    announcement=announcement_text,
+                                    audio_bytes=len(announcement_audio),
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Operator Zero predial announcement cache lookup failed",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+
+                        if not announcement_audio:
+                            announcement_audio = await self._local_ai_server_tts(
+                                call_id=call_id,
+                                text=announcement_text,
+                                timeout_sec=8.0,
+                            )
+
+                        announcement_completed = False
+
+                        if announcement_audio:
+                            played_id = await self._play_ulaw_bytes_on_channel_and_wait(
+                                channel_id=predial_channel_id,
+                                audio_bytes=announcement_audio,
+                                playback_id_prefix="predial-trusted-finalize",
+                                timeout_sec=32.0,
+                            )
+
+                            announcement_completed = bool(played_id)
+
+                            logger.info(
+                                "Operator Zero predial finalize announcement playback",
+                                call_id=call_id,
+                                playback_id=played_id,
+                                played=announcement_completed,
+                            )
+                        else:
+                            logger.warning(
+                                "Operator Zero predial finalize announcement TTS failed",
+                                call_id=call_id,
+                                caller_name=caller_name,
+                            )
+
+                        session = await self.session_store.get_by_call_id(call_id) or session
+                        latest_action = dict(
+                            getattr(session, "current_action", None) or {}
+                        )
+
+                        if latest_action.get("type") == "predial_transfer":
+                            latest_action["private_announcement_played"] = (
+                                announcement_completed
+                            )
+                            session.current_action = latest_action
+                            await self._save_session(session)
+
+                except Exception:
+                    logger.warning(
+                        "Operator Zero predial finalize private announcement failed",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
+
                 ok = await self._finalize_predial_transfer_bridge(session, predial_channel_id)
                 if ok:
                     return {
@@ -6851,16 +7156,51 @@ class Engine:
                     }
                 return {"status": "failed", "message": "Predial destination answered, but bridging failed."}
 
-            if not moh_started and moh_class:
+            # The outside caller channel is already answered, so ARI /ring
+            # signaling does not reliably produce audible ringback. Play the
+            # Asterisk ring tone as media instead.
+            #
+            # Keep using moh_started as the existing one-shot flag.
+            if not moh_started:
                 try:
-                    await self.ari_client.send_command(
-                        method="POST",
-                        resource=f"channels/{session.caller_channel_id}/moh",
-                        params={"mohClass": moh_class},
+                    ringback_playback_id = (
+                        f"predial-ringback-{call_id.replace('.', '-')}"
                     )
-                    moh_started = True
+
+                    started = await self.ari_client.play_media_on_channel_with_id(
+                        session.caller_channel_id,
+                        "tone:ring",
+                        ringback_playback_id,
+                    )
+
+                    if started:
+                        action = dict(
+                            getattr(session, "current_action", None) or {}
+                        )
+                        action["ringback_playback_id"] = ringback_playback_id
+                        session.current_action = action
+                        await self._save_session(session)
+
+                        moh_started = True
+
+                        logger.info(
+                            "Predial audible caller ringback started",
+                            call_id=call_id,
+                            caller_channel_id=session.caller_channel_id,
+                            playback_id=ringback_playback_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Predial audible caller ringback failed to start",
+                            call_id=call_id,
+                        )
+
                 except Exception:
-                    logger.debug("Failed to start predial wait MOH", call_id=call_id, exc_info=True)
+                    logger.debug(
+                        "Failed to start predial audible caller ringback",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
 
             await asyncio.sleep(0.05)
 
@@ -6873,10 +7213,172 @@ class Engine:
                 await self.ari_client.hangup_channel(predial_channel_id)
         if session:
             with contextlib.suppress(Exception):
-                await self.ari_client.send_command(method="DELETE", resource=f"channels/{session.caller_channel_id}/moh")
+                ringback_id = str(
+                    (getattr(session, "current_action", None) or {}).get(
+                        "ringback_playback_id"
+                    )
+                    or ""
+                ).strip()
+                if ringback_id:
+                    await self.ari_client.send_command(
+                        method="DELETE",
+                        resource=f"playbacks/{ringback_id}",
+                    )
             session.current_action = None
             await self._save_session(session)
-        return {"status": "failed", "message": "Predial destination did not answer before the bridge timeout."}
+        # Operator Zero: an unanswered household ring is terminal for this
+        # screening attempt. Do NOT return a failed transfer to the AI, because
+        # the model may try blind_transfer again and repeatedly ring the house.
+        #
+        # Instead, permanently hand this caller to the Asterisk voicemail
+        # dialplan for mailbox 100.
+        caller_channel_id = str(
+            getattr(context, "caller_channel_id", "") or call_id
+        ).strip()
+
+        try:
+            latest = await self.session_store.get_by_call_id(call_id) or session
+
+            if latest:
+                latest.current_action = None
+                latest.transfer_active = True
+                latest.transfer_state = "voicemail"
+                latest.transfer_target = "Voicemail 100"
+                await self._save_session(latest)
+
+            logger.info(
+                "Operator Zero household did not answer; routing caller to voicemail",
+                call_id=call_id,
+                caller_channel_id=caller_channel_id,
+                mailbox="100@default",
+            )
+
+            # Stop any caller-side ringback that belonged to the predial
+            # attempt before leaving Operator Zero.
+            ringback_id = str(current.get("ringback_playback_id") or "").strip()
+            if ringback_id:
+                stopped = await self.ari_client.stop_playback(ringback_id)
+
+                logger.info(
+                    "Operator Zero predial ringback stop result",
+                    call_id=call_id,
+                    caller_channel_id=caller_channel_id,
+                    playback_id=ringback_id,
+                    stopped=stopped,
+                )
+
+                if not stopped:
+                    logger.warning(
+                        "Operator Zero predial ringback did not confirm stopped",
+                        call_id=call_id,
+                        caller_channel_id=caller_channel_id,
+                        playback_id=ringback_id,
+                    )
+
+            # Explicitly remove the original outside caller from Operator
+            # Zero's mixing bridge before continuing the channel back into
+            # the Asterisk dialplan.  Leaving it attached to the AI bridge
+            # can leave the caller sitting in Stasis after predial timeout.
+            bridge_id = str(session.bridge_id or "").strip()
+            if bridge_id:
+                try:
+                    logger.info(
+                        "Operator Zero detaching outside caller from AI bridge",
+                        call_id=call_id,
+                        caller_channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                    )
+
+                    await asyncio.wait_for(
+                        self.ari_client.send_command(
+                            method="DELETE",
+                            resource=f"bridges/{bridge_id}/channel",
+                            params={"channel": caller_channel_id},
+                        ),
+                        timeout=2.0,
+                    )
+
+                    logger.info(
+                        "Operator Zero outside caller detached from AI bridge",
+                        call_id=call_id,
+                        caller_channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                    )
+
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Operator Zero timed out detaching caller from AI bridge",
+                        call_id=call_id,
+                        caller_channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                    )
+
+                except Exception:
+                    logger.warning(
+                        "Operator Zero failed to detach caller from AI bridge",
+                        call_id=call_id,
+                        caller_channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                        exc_info=True,
+                    )
+
+            # The normal AVA voicemail tool also allows a short media-settle
+            # period before continue().  We only need a brief delay here
+            # because no AI announcement remains to be spoken.
+            await asyncio.sleep(0.25)
+
+            logger.info(
+                "Operator Zero continuing outside caller into voicemail dialplan",
+                call_id=call_id,
+                caller_channel_id=caller_channel_id,
+                context="operator-zero-voicemail",
+                extension="s",
+            )
+
+            continued = await self.ari_client.continue_in_dialplan(
+                caller_channel_id,
+                context="operator-zero-voicemail",
+                extension="s",
+                priority=1,
+            )
+
+            logger.info(
+                "Operator Zero voicemail dialplan continue result",
+                call_id=call_id,
+                caller_channel_id=caller_channel_id,
+                continued=continued,
+            )
+
+            if continued is True:
+                return {
+                    "status": "success",
+                    "message": "The household did not answer. The caller was sent to voicemail.",
+                    "destination": "100@default",
+                    "strategy": "operator_zero_voicemail",
+                }
+
+            if continued is False:
+                raise RuntimeError(
+                    f"Asterisk rejected voicemail dialplan continue for channel "
+                    f"{caller_channel_id}"
+                )
+
+            raise RuntimeError(
+                f"Voicemail dialplan continue result was indeterminate for channel "
+                f"{caller_channel_id}"
+            )
+
+        except Exception:
+            logger.error(
+                "Operator Zero failed to route unanswered caller to voicemail",
+                call_id=call_id,
+                caller_channel_id=caller_channel_id,
+                exc_info=True,
+            )
+            return {
+                "status": "failed",
+                "message": "The household did not answer and voicemail routing failed.",
+            }
 
     async def _finalize_predial_transfer_bridge(self, session: "CallSession", predial_channel_id: str) -> bool:
         call_id = session.call_id
@@ -6909,7 +7411,17 @@ class Engine:
         bridge_guard.add(call_id)
         try:
             try:
-                await self.ari_client.send_command(method="DELETE", resource=f"channels/{session.caller_channel_id}/moh")
+                ringback_id = str(
+                    (getattr(session, "current_action", None) or {}).get(
+                        "ringback_playback_id"
+                    )
+                    or ""
+                ).strip()
+                if ringback_id:
+                    await self.ari_client.send_command(
+                        method="DELETE",
+                        resource=f"playbacks/{ringback_id}",
+                    )
             except Exception:
                 pass
 
@@ -6969,6 +7481,46 @@ class Engine:
                 await self._save_session(session)
             except Exception:
                 logger.debug("Failed to persist predial transfer bridge state", call_id=call_id, exc_info=True)
+
+            # Operator Zero:
+            # Approval requires BOTH a successful private announcement and
+            # an actual bridge. Answering the inside phone alone is not
+            # sufficient. In particular, hanging up during the announcement
+            # must not approve the outside caller.
+            try:
+                session = await self.session_store.get_by_call_id(call_id) or session
+                approval_action = dict(
+                    getattr(session, "current_action", None) or {}
+                )
+
+                announcement_completed = bool(
+                    approval_action.get("private_announcement_played")
+                )
+
+                if announcement_completed:
+                    await self._operator_zero_mark_caller_trusted(session)
+
+                    logger.info(
+                        "Operator Zero caller trusted after completed "
+                        "private announcement and predial bridge",
+                        call_id=call_id,
+                        caller_number=getattr(session, "caller_number", None),
+                    )
+                else:
+                    logger.info(
+                        "Operator Zero caller NOT trusted: private "
+                        "announcement did not complete",
+                        call_id=call_id,
+                        caller_number=getattr(session, "caller_number", None),
+                    )
+
+            except Exception:
+                logger.warning(
+                    "Operator Zero automatic trust after predial bridge failed",
+                    call_id=call_id,
+                    caller_number=getattr(session, "caller_number", None),
+                    exc_info=True,
+                )
 
             logger.info(
                 "Predial transfer bridged",
@@ -7858,7 +8410,133 @@ class Engine:
         return None
 
     async def _local_ai_server_tts(self, *, call_id: str, text: str, timeout_sec: float) -> Optional[bytes]:
-        """Synthesize μ-law 8k audio via local-ai-server (hard requirement for attended transfer)."""
+        """
+        Synthesize private Operator Zero announcement audio as G.711 μ-law/8 kHz.
+
+        Prefer OpenAI Speech with the same Marin voice used by the incoming
+        Operator Zero Realtime agent.  Fall back to the Local AI Server if
+        OpenAI speech is unavailable.
+        """
+        try:
+            import json
+            import os
+            import urllib.request
+
+            providers = getattr(self.config, "providers", {}) or {}
+
+            # Prefer the normal environment variable.  Also accept an api_key
+            # from an OpenAI provider configuration if this deployment keeps
+            # credentials there instead.
+            api_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
+
+            if not api_key and isinstance(providers, dict):
+                for provider_name in (
+                    "openai_realtime",
+                    "openai",
+                    "openai_responses",
+                ):
+                    provider_cfg = providers.get(provider_name)
+                    if isinstance(provider_cfg, dict):
+                        candidate = str(
+                            provider_cfg.get("api_key") or ""
+                        ).strip()
+                        if candidate:
+                            api_key = candidate
+                            break
+
+            if api_key:
+                payload = json.dumps(
+                    {
+                        "model": "gpt-4o-mini-tts",
+                        "voice": "marin",
+                        "input": text,
+                        "response_format": "pcm",
+                    }
+                ).encode("utf-8")
+
+                def _request_openai_tts() -> bytes:
+                    request = urllib.request.Request(
+                        "https://api.openai.com/v1/audio/speech",
+                        data=payload,
+                        method="POST",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+
+                    with urllib.request.urlopen(
+                        request,
+                        timeout=max(1.0, float(timeout_sec)),
+                    ) as response:
+                        return response.read()
+
+                pcm_24k = await asyncio.wait_for(
+                    asyncio.to_thread(_request_openai_tts),
+                    timeout=max(1.0, float(timeout_sec)),
+                )
+
+                if pcm_24k:
+                    # OpenAI PCM speech is signed 16-bit little-endian PCM.
+                    # Convert it to the format expected by the existing
+                    # attended-transfer announcement playback path:
+                    # G.711 μ-law, mono, 8 kHz.
+                    process = await asyncio.create_subprocess_exec(
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "s16le",
+                        "-ar",
+                        "24000",
+                        "-ac",
+                        "1",
+                        "-i",
+                        "pipe:0",
+                        "-f",
+                        "mulaw",
+                        "-ar",
+                        "8000",
+                        "-ac",
+                        "1",
+                        "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+
+                    mulaw_audio, ffmpeg_error = await asyncio.wait_for(
+                        process.communicate(pcm_24k),
+                        timeout=max(1.0, float(timeout_sec)),
+                    )
+
+                    if process.returncode == 0 and mulaw_audio:
+                        logger.info(
+                            "Operator Zero private announcement synthesized with OpenAI Marin",
+                            call_id=call_id,
+                            text=text,
+                            audio_bytes=len(mulaw_audio),
+                        )
+                        return mulaw_audio
+
+                    logger.warning(
+                        "OpenAI Marin announcement conversion failed; falling back to Local AI Server",
+                        call_id=call_id,
+                        ffmpeg_error=ffmpeg_error.decode(
+                            "utf-8",
+                            errors="replace",
+                        )[:300],
+                    )
+
+        except Exception:
+            logger.warning(
+                "OpenAI Marin private announcement TTS failed; falling back to Local AI Server",
+                call_id=call_id,
+                exc_info=True,
+            )
+
+        # Existing Local AI Server fallback.
         try:
             import base64
             import json
@@ -7866,15 +8544,33 @@ class Engine:
 
             providers = getattr(self.config, "providers", {}) or {}
             local_cfg = providers.get("local") if isinstance(providers, dict) else None
+
             if not isinstance(local_cfg, dict) or not bool(local_cfg.get("enabled", True)):
                 return None
-            ws_url = str(local_cfg.get("base_url") or local_cfg.get("ws_url") or "").strip()
+
+            ws_url = str(
+                local_cfg.get("base_url")
+                or local_cfg.get("ws_url")
+                or ""
+            ).strip()
+
             if not ws_url:
                 return None
-            auth_token = str(local_cfg.get("auth_token") or "").strip() or None
-            deadline = time.time() + max(0.1, float(timeout_sec))
 
-            async with websockets.connect(ws_url, open_timeout=float(timeout_sec), ping_interval=None) as ws:
+            auth_token = str(
+                local_cfg.get("auth_token") or ""
+            ).strip() or None
+
+            deadline = time.time() + max(
+                0.1,
+                float(timeout_sec),
+            )
+
+            async with websockets.connect(
+                ws_url,
+                open_timeout=float(timeout_sec),
+                ping_interval=None,
+            ) as ws:
                 if not await self._authenticate_local_ai_server_ws(
                     ws=ws,
                     call_id=call_id,
@@ -7882,6 +8578,7 @@ class Engine:
                     deadline=deadline,
                 ):
                     return None
+
                 await ws.send(
                     json.dumps(
                         {
@@ -7892,19 +8589,40 @@ class Engine:
                         }
                     )
                 )
+
                 while time.time() < deadline:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, float(deadline - time.time())))
+                    msg = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=max(
+                            0.1,
+                            float(deadline - time.time()),
+                        ),
+                    )
+
                     if isinstance(msg, bytes):
                         continue
+
                     try:
                         data = json.loads(msg)
                     except Exception:
                         continue
-                    if data.get("type") == "tts_response" and data.get("audio_data"):
-                        return base64.b64decode(data["audio_data"])
+
+                    if (
+                        data.get("type") == "tts_response"
+                        and data.get("audio_data")
+                    ):
+                        return base64.b64decode(
+                            data["audio_data"]
+                        )
+
                 return None
+
         except Exception:
-            logger.debug("Local AI Server TTS failed", call_id=call_id, exc_info=True)
+            logger.debug(
+                "Local AI Server TTS failed",
+                call_id=call_id,
+                exc_info=True,
+            )
             return None
 
     async def _authenticate_local_ai_server_ws(
@@ -8318,6 +9036,12 @@ class Engine:
             await self._attended_transfer_abort_and_resume(session, channel_id, reason="declined")
             return
 
+        # Household explicitly accepted this caller. Persist trust asynchronously
+        # so the next call from this number can be recognized automatically.
+        asyncio.create_task(
+            self._operator_zero_mark_caller_trusted(session)
+        )
+
         logger.info("🔀 ATTENDED TRANSFER - Accepted, bridging caller", call_id=caller_id, digit=digit)
         await self._attended_transfer_finalize_bridge(
             session,
@@ -8327,6 +9051,665 @@ class Engine:
             tts_timeout=tts_timeout,
             template_vars=template_vars,
         )
+
+    def _operator_zero_extract_name_from_utterance(self, utterance: str) -> str:
+        """Extract a caller's explicit spoken name from one utterance."""
+        import re as _re
+
+        text = str(utterance or "").strip()
+        if not text:
+            return ""
+
+        text = _re.sub(
+            r"^(?:uh|um|erm)[, ]+",
+            "",
+            text,
+            flags=_re.IGNORECASE,
+        ).strip()
+
+        patterns = [
+            r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?this is\s+"
+            r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+            r"(?=[.!?,](?:\s|$)|$)",
+
+            r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?my name is\s+"
+            r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+            r"(?=[.!?,](?:\s|$)|$)",
+
+            r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i am\s+"
+            r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+            r"(?=[.!?,](?:\s|$)|$)",
+
+            r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i['’]m\s+"
+            r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+            r"(?=[.!?,](?:\s|$)|$)",
+        ]
+
+        relationship_words = {
+            "wife", "husband", "spouse",
+            "mother", "father", "mom", "mum", "dad",
+            "daughter", "son", "sister", "brother",
+            "aunt", "uncle", "cousin",
+            "friend", "neighbor", "neighbour",
+            "girlfriend", "boyfriend", "partner",
+        }
+
+        for pattern in patterns:
+            match = _re.match(pattern, text, flags=_re.IGNORECASE)
+            if not match:
+                continue
+
+            raw_name = match.group(1).strip().rstrip(".,!?;:")
+
+            words = {
+                word.casefold().strip(".,!?;:")
+                for word in raw_name.split()
+            }
+
+            if words & relationship_words:
+                return ""
+
+            return " ".join(
+                part.capitalize()
+                for part in raw_name.split()
+            ).strip()
+
+        return ""
+
+    async def _operator_zero_extract_spoken_caller_name(
+        self,
+        session: "CallSession",
+    ) -> str:
+        """
+        Best-effort extraction of the name the caller actually gave during
+        the Operator Zero conversation.
+
+        Prefer the caller's spoken identity over telephone Caller ID.
+        Return an empty string when the caller did not clearly identify
+        themselves.
+        """
+        logger.info(
+            "Operator Zero caller name extractor entered",
+            call_id=getattr(session, "call_id", None),
+            caller_number=getattr(session, "caller_number", None),
+        )
+
+        try:
+            recent_messages = list(
+                getattr(session, "conversation_history", []) or []
+            )[-16:]
+
+            transcript_lines = []
+
+            for message in recent_messages:
+                if not isinstance(message, dict):
+                    continue
+
+                role = str(
+                    message.get("role") or ""
+                ).strip().lower()
+
+                content = str(
+                    message.get("content") or ""
+                ).strip()
+
+                if not content:
+                    continue
+
+                transcript_lines.append(
+                    f"{role}: {content}"
+                )
+
+            # conversation_history is the preferred source because it gives
+            # the name extractor conversational context.  However, some provider
+            # / transfer timing paths may leave the history unavailable here even
+            # though the most recent final caller transcript was captured.
+            #
+            # last_transcript is maintained independently by the provider event
+            # handler, so use it as a fallback rather than losing caller-name
+            # learning entirely.
+            last_transcript = str(
+                getattr(session, "last_transcript", "") or ""
+            ).strip()
+
+            if last_transcript:
+                last_line = f"user: {last_transcript}"
+                if last_line not in transcript_lines:
+                    transcript_lines.append(last_line)
+
+            if not transcript_lines:
+                logger.info(
+                    "Operator Zero caller name extraction has no transcript evidence",
+                    call_id=getattr(session, "call_id", None),
+                )
+                return ""
+
+            transcript = "\n".join(transcript_lines)
+
+            logger.info(
+                "Operator Zero caller name extraction evidence",
+                call_id=getattr(session, "call_id", None),
+                history_messages=len(recent_messages),
+                transcript_lines=len(transcript_lines),
+                last_transcript=last_transcript or None,
+            )
+
+            # First handle explicit self-identification deterministically.
+            # This is more reliable and much faster than making another LLM
+            # request for common introductions such as:
+            #
+            #   "This is Brian."
+            #   "My name is Brian Smith."
+            #   "I'm Susan."
+            #
+            # Only inspect USER turns so we never accidentally learn the
+            # operator's name.
+            import re as _re
+
+            explicit_patterns = [
+                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?this is\s+"
+                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+                r"(?=[.!?,](?:\s|$)|$)",
+
+                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?my name is\s+"
+                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+                r"(?=[.!?,](?:\s|$)|$)",
+
+                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i am\s+"
+                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+                r"(?=[.!?,](?:\s|$)|$)",
+
+                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i['’]m\s+"
+                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
+                r"(?=[.!?,](?:\s|$)|$)",
+            ]
+
+            # Prefer the earliest clear self-identification.
+            for message in recent_messages:
+                if not isinstance(message, dict):
+                    continue
+
+                if str(message.get("role") or "").strip().lower() != "user":
+                    continue
+
+                utterance = str(message.get("content") or "").strip()
+                if not utterance:
+                    continue
+
+                # Remove harmless speech fillers before matching.
+                cleaned = _re.sub(
+                    r"^(?:uh|um|erm)[, ]+",
+                    "",
+                    utterance,
+                    flags=_re.IGNORECASE,
+                ).strip()
+
+                for pattern in explicit_patterns:
+                    match = _re.match(
+                        pattern,
+                        cleaned,
+                        flags=_re.IGNORECASE,
+                    )
+
+                    if not match:
+                        continue
+
+                    raw_name = match.group(1).strip()
+
+                    # Remove sentence punctuation captured at the end of
+                    # an otherwise valid spoken name.
+                    raw_name = raw_name.rstrip(".,!?;:")
+
+                    # Do not mistake a relationship description for the
+                    # caller's actual name.  For example:
+                    #
+                    #   "I'm Brian's wife."
+                    #   "I'm his husband."
+                    #   "I'm Susan's friend."
+                    #
+                    # These may be useful screening context, but they are not
+                    # the caller's spoken name.
+                    relationship_words = {
+                        "wife",
+                        "husband",
+                        "spouse",
+                        "mother",
+                        "father",
+                        "mom",
+                        "mum",
+                        "dad",
+                        "daughter",
+                        "son",
+                        "sister",
+                        "brother",
+                        "aunt",
+                        "uncle",
+                        "cousin",
+                        "friend",
+                        "neighbor",
+                        "neighbour",
+                        "girlfriend",
+                        "boyfriend",
+                        "partner",
+                    }
+
+                    raw_words = {
+                        word.casefold().strip(".,!?;:")
+                        for word in raw_name.split()
+                    }
+
+                    if raw_words & relationship_words:
+                        logger.info(
+                            "Operator Zero rejected relationship as caller name",
+                            call_id=getattr(session, "call_id", None),
+                            candidate=raw_name,
+                            source_transcript=utterance,
+                        )
+                        continue
+
+                    name = " ".join(
+                        part.capitalize()
+                        for part in raw_name.split()
+                    ).strip()
+
+                    if name:
+                        logger.info(
+                            "Operator Zero learned explicit caller spoken name",
+                            call_id=getattr(session, "call_id", None),
+                            caller_name=name,
+                            source_transcript=utterance,
+                        )
+                        return name
+
+            # A caller will very commonly answer the initial Operator Zero
+            # greeting with only their name:
+            #
+            #   Operator: "Whom may I say is calling?"
+            #   Caller:   "Rufus."
+            #
+            # Recognize a short name-only USER turn when it immediately
+            # follows an assistant turn asking who is calling.
+            relationship_words = {
+                "wife",
+                "husband",
+                "spouse",
+                "mother",
+                "father",
+                "mom",
+                "mum",
+                "dad",
+                "daughter",
+                "son",
+                "sister",
+                "brother",
+                "aunt",
+                "uncle",
+                "cousin",
+                "friend",
+                "neighbor",
+                "neighbour",
+                "girlfriend",
+                "boyfriend",
+                "partner",
+            }
+
+            caller_question_markers = (
+                "whom may i say is calling",
+                "who may i say is calling",
+                "who is calling",
+                "who's calling",
+                "may i ask who's calling",
+                "may i ask who is calling",
+                "your name",
+            )
+
+            for index, message in enumerate(recent_messages):
+                if not isinstance(message, dict):
+                    continue
+
+                if str(message.get("role") or "").strip().lower() != "user":
+                    continue
+
+                utterance = str(message.get("content") or "").strip()
+                if not utterance:
+                    continue
+
+                # Bare-name recognition is deliberately conservative:
+                # one to four name-like words and no sentence structure.
+                bare_candidate = utterance.strip().rstrip(".,!?;:").strip()
+
+                if not _re.fullmatch(
+                    r"[A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}",
+                    bare_candidate,
+                    flags=_re.IGNORECASE,
+                ):
+                    continue
+
+                candidate_words = {
+                    word.casefold().strip(".,!?;:")
+                    for word in bare_candidate.split()
+                }
+
+                if candidate_words & relationship_words:
+                    continue
+
+                # Confirm that the preceding assistant turn actually asked
+                # for the caller's identity.  This prevents us from treating
+                # arbitrary short answers elsewhere in the conversation as
+                # names.
+                previous_assistant_text = ""
+
+                for previous in reversed(recent_messages[:index]):
+                    if not isinstance(previous, dict):
+                        continue
+
+                    if (
+                        str(previous.get("role") or "").strip().lower()
+                        == "assistant"
+                    ):
+                        previous_assistant_text = str(
+                            previous.get("content") or ""
+                        ).strip().casefold()
+                        break
+
+                if not previous_assistant_text:
+                    continue
+
+                if not any(
+                    marker in previous_assistant_text
+                    for marker in caller_question_markers
+                ):
+                    continue
+
+                name = " ".join(
+                    part.capitalize()
+                    for part in bare_candidate.split()
+                ).strip()
+
+                if name:
+                    logger.info(
+                        "Operator Zero learned bare caller spoken name",
+                        call_id=getattr(session, "call_id", None),
+                        caller_name=name,
+                        source_transcript=utterance,
+                    )
+                    return name
+
+            # No simple explicit introduction was found. Fall back to the
+            # Local AI Server for conversational cases such as:
+            # "Steve here" or "John from next door."
+            prompt = (
+                "Determine the name of the HUMAN CALLER from this telephone "
+                "conversation.\n"
+                "Use only a name that the caller clearly gives or clearly "
+                "identifies themselves by.\n"
+                "Do not use the telephone operator's name.\n"
+                "Do not infer a name merely because another person is mentioned.\n"
+                "If a full name is clearly given, return the full name.\n"
+                "If only a first name is given, return the first name.\n"
+                "If the caller's name is not clear, return exactly NONE.\n"
+                "Return ONLY the name or NONE. No explanation, punctuation, "
+                "JSON, or other text.\n\n"
+                "Conversation:\n"
+                f"{transcript}"
+            )
+
+            response = await self._local_ai_server_llm_request(
+                call_id=getattr(session, "call_id", "") or "operator-zero-name",
+                text=prompt,
+                timeout_sec=2.5,
+            )
+
+            name = str(response or "").strip().strip('"').strip("'")
+
+            if not name:
+                return ""
+
+            if name.casefold() in {
+                "none",
+                "unknown",
+                "not known",
+                "not provided",
+                "caller",
+                "the caller",
+            }:
+                return ""
+
+            # A caller name should be short. Reject responses that look like
+            # sentences or malformed LLM output.
+            if len(name) > 80 or len(name.split()) > 6:
+                return ""
+
+            if any(ch in name for ch in "{}[]\n\r"):
+                return ""
+
+            return name
+
+        except Exception as exc:
+            logger.warning(
+                "Operator Zero spoken caller name extraction failed",
+                call_id=getattr(session, "call_id", None),
+                error=str(exc),
+                exc_info=True,
+            )
+            return ""
+
+    async def _operator_zero_extract_spoken_business_name(
+        self,
+        session: "CallSession",
+    ) -> str:
+        """
+        Best-effort extraction of a business or organization that the caller
+        explicitly says they represent.
+
+        Examples:
+          "This is Brian from Acme Plumbing."
+          "I'm Susan with Pacific Gas and Electric."
+          "I'm calling from Acme Plumbing."
+          "This is Acme Plumbing."
+        """
+        import re as _re
+
+        recent_messages = list(
+            getattr(session, "conversation_history", []) or []
+        )[-16:]
+
+        user_utterances = []
+
+        for message in recent_messages:
+            if not isinstance(message, dict):
+                continue
+
+            if str(message.get("role") or "").strip().lower() != "user":
+                continue
+
+            utterance = str(message.get("content") or "").strip()
+            if utterance:
+                user_utterances.append(utterance)
+
+        last_transcript = str(
+            getattr(session, "last_transcript", "") or ""
+        ).strip()
+
+        if last_transcript and last_transcript not in user_utterances:
+            user_utterances.append(last_transcript)
+
+        # Strong forms where the caller explicitly associates themselves
+        # with an organization.
+        patterns = [
+            r"\b(?:i(?:'|’)m|i am|this is)\s+"
+            r"[A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}"
+            r"\s+(?:from|with)\s+(.+?)[.!?]*$",
+
+            r"\bi(?:'|’)m\s+calling\s+(?:from|with)\s+(.+?)[.!?]*$",
+
+            r"\bi am\s+calling\s+(?:from|with)\s+(.+?)[.!?]*$",
+
+            r"\bcalling\s+(?:from|with)\s+(.+?)[.!?]*$",
+
+            r"\bi(?:'|’)m\s+with\s+(.+?)[.!?]*$",
+
+            r"\bi am\s+with\s+(.+?)[.!?]*$",
+        ]
+
+        for utterance in user_utterances:
+            cleaned = _re.sub(
+                r"^(?:uh|um|erm)[, ]+",
+                "",
+                utterance,
+                flags=_re.IGNORECASE,
+            ).strip()
+
+            for pattern in patterns:
+                match = _re.search(
+                    pattern,
+                    cleaned,
+                    flags=_re.IGNORECASE,
+                )
+
+                if not match:
+                    continue
+
+                business_name = match.group(1).strip().rstrip(".,!?;:")
+
+                # Keep obviously malformed captures out of memory.
+                if (
+                    not business_name
+                    or len(business_name) > 100
+                    or len(business_name.split()) > 12
+                ):
+                    continue
+
+                logger.info(
+                    "Operator Zero learned explicit caller business name",
+                    call_id=getattr(session, "call_id", None),
+                    business_name=business_name,
+                    source_transcript=utterance,
+                )
+
+                return business_name
+
+        return ""
+
+    async def _operator_zero_mark_caller_trusted(self, session: "CallSession") -> None:
+        """
+        Notify Operator Zero's private memory service that the household
+        explicitly accepted this caller during attended-transfer screening.
+
+        Best effort only: failure must never prevent or delay the transfer.
+        """
+        try:
+            import json as _json
+            import os as _os
+            import urllib.request as _urllib_request
+
+            caller_number = str(getattr(session, "caller_number", "") or "").strip()
+
+            # Prefer the identity the caller actually gave Operator Zero.
+            spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(
+                session
+            )
+
+            spoken_business_name = await self._operator_zero_extract_spoken_business_name(
+                session
+            )
+
+            caller_id_name = str(
+                getattr(session, "caller_name", "") or ""
+            ).strip()
+
+            caller_name = spoken_caller_name or caller_id_name
+            business_name = spoken_business_name
+
+            if spoken_caller_name:
+                # Promote the learned name into the live session as well.
+                session.caller_name = spoken_caller_name
+
+                try:
+                    await self._save_session(session)
+                except Exception:
+                    logger.debug(
+                        "Operator Zero failed to persist learned caller name",
+                        call_id=getattr(session, "call_id", None),
+                        exc_info=True,
+                    )
+
+                logger.info(
+                    "Operator Zero learned caller spoken name",
+                    call_id=getattr(session, "call_id", None),
+                    caller_number=caller_number,
+                    caller_name=spoken_caller_name,
+                )
+
+            if spoken_business_name:
+                logger.info(
+                    "Operator Zero learned caller business name",
+                    call_id=getattr(session, "call_id", None),
+                    caller_number=caller_number,
+                    business_name=spoken_business_name,
+                )
+
+            if not caller_number:
+                logger.info(
+                    "Operator Zero trust update skipped: caller number unavailable",
+                    call_id=getattr(session, "call_id", None),
+                )
+                return
+
+            base_url = str(
+                _os.environ.get(
+                    "OPERATOR_ZERO_MEMORY_URL",
+                    "http://192.168.1.40:8790",
+                )
+                or "http://192.168.1.40:8790"
+            ).rstrip("/")
+
+            url = base_url + "/caller/accepted"
+
+            payload = _json.dumps(
+                {
+                    "caller_number": caller_number,
+                    "caller_name": caller_name,
+                    "business_name": business_name,
+                }
+            ).encode("utf-8")
+
+            def _post():
+                request = _urllib_request.Request(
+                    url,
+                    data=payload,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                    },
+                )
+
+                with _urllib_request.urlopen(request, timeout=2.0) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                    return int(response.status), body
+
+            status, body = await asyncio.to_thread(_post)
+
+            if 200 <= status < 300:
+                logger.info(
+                    "Operator Zero caller marked trusted after household acceptance",
+                    call_id=getattr(session, "call_id", None),
+                    caller_number=caller_number,
+                )
+            else:
+                logger.warning(
+                    "Operator Zero trust service returned non-success status",
+                    call_id=getattr(session, "call_id", None),
+                    http_status=status,
+                    response_preview=body[:200],
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "Operator Zero caller trust update failed",
+                call_id=getattr(session, "call_id", None),
+                error=str(exc),
+            )
 
     async def _attended_transfer_abort_and_resume(self, session: "CallSession", agent_channel_id: str, *, reason: str) -> None:
         call_id = session.call_id
@@ -9096,7 +10479,24 @@ class Engine:
                         if action.get("type") != "predial_transfer" or not action.get("bridged"):
                             await self._handle_unbridged_predial_transfer_channel_end(mapped_session, channel_or_call_id)
                             return
+
+                        # A bridged predial destination is the household phone.
+                        # If that leg hangs up, the outside PSTN caller must
+                        # terminate as well.  Do this here so BOTH StasisEnd
+                        # and ChannelDestroyed take the same supervised path.
                         session = mapped_session
+                        force_caller_hangup = True
+
+                        logger.info(
+                            "Predial destination ended after bridge; forcing caller hangup",
+                            call_id=mapped_call_id,
+                            predial_channel_id=channel_or_call_id,
+                            caller_channel_id=getattr(
+                                mapped_session,
+                                "caller_channel_id",
+                                None,
+                            ),
+                        )
             if not session:
                 logger.debug("No session found during cleanup", identifier=channel_or_call_id)
                 # Codex P1: a single call has multiple channels (caller + aux media legs:
@@ -9438,7 +10838,7 @@ class Engine:
                         external_call_id=getattr(session, "external_call_id", None),
                         finalized=bool(getattr(session, "external_finalized", False)),
                     )
-            elif not transfer_active:
+            elif force_caller_hangup or not transfer_active:
                 try:
                     await self.ari_client.hangup_channel(session.caller_channel_id)
                 except Exception:
@@ -13474,8 +14874,39 @@ class Engine:
                     logger.debug("Failed clearing output suppression on AgentAudioDone", call_id=call_id, exc_info=True)
                 continuous = bool(getattr(self.streaming_playback_manager, 'continuous_stream', False))
                 q = self._provider_stream_queues.get(call_id)
-                if continuous:
-                    # Do NOT end the stream; mark boundary and end per-segment gating
+
+                # The initial greeting is a one-shot stream even when normal
+                # conversation uses continuous streaming. Once OpenAI reports
+                # AgentAudioDone, terminate the greeting stream so the pacer
+                # drains its remaining audio, clears greeting gating, and the
+                # caller can speak immediately.
+                _active_stream = self.streaming_playback_manager.active_streams.get(call_id) or {}
+                _is_greeting_stream = str(
+                    _active_stream.get("playback_type") or ""
+                ).strip().lower() == "greeting"
+
+                if continuous and _is_greeting_stream:
+                    if q is not None:
+                        try:
+                            q.put_nowait(None)
+                        except asyncio.QueueFull:
+                            asyncio.create_task(q.put(None))
+                        self._provider_stream_queues.pop(call_id, None)
+                    else:
+                        logger.debug(
+                            "Greeting AgentAudioDone with no active stream queue",
+                            call_id=call_id,
+                        )
+                    self._provider_stream_formats.pop(call_id, None)
+                    logger.info(
+                        "Greeting AgentAudioDone - closing one-shot greeting stream",
+                        call_id=call_id,
+                        provider=getattr(session, "provider_name", None),
+                    )
+
+                elif continuous:
+                    # Do NOT end normal conversational streams; mark boundary
+                    # and end per-segment gating.
                     try:
                         await self.streaming_playback_manager.mark_segment_boundary(call_id)
                     except Exception:
@@ -13989,6 +15420,26 @@ class Engine:
                     if not hasattr(session, 'conversation_history') or session.conversation_history is None:
                         session.conversation_history = []
                     session.conversation_history.append(_ts_msg("user", text))
+
+                    # Operator Zero: remember an explicitly spoken caller name
+                    # immediately, while the transcript is definitely available.
+                    try:
+                        spoken_name = self._operator_zero_extract_name_from_utterance(text)
+                        if spoken_name:
+                            session.caller_name = spoken_name
+                            logger.info(
+                                "Operator Zero learned caller name from live transcript",
+                                call_id=call_id,
+                                caller_name=spoken_name,
+                                source_transcript=text,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Operator Zero live caller-name extraction failed",
+                            call_id=call_id,
+                            exc_info=True,
+                        )
+
                     await self.session_store.upsert_call(session)
                     logger.debug("Added user transcript to history", call_id=call_id, text_preview=text[:50])
             
@@ -20188,6 +21639,28 @@ class Engine:
                 status=result.get("status"),
                 message=result.get("message"),
             )
+
+            # Operator Zero:
+            # A successful deferred transfer to the house is the approval event.
+            # Trust the original outside caller for future calls.
+            if str(result.get("status") or "").strip().lower() == "success":
+                try:
+                    await self._operator_zero_mark_caller_trusted(session)
+
+                    logger.info(
+                        "Operator Zero caller trusted after successful transfer",
+                        call_id=call_id,
+                        caller_number=getattr(session, "caller_number", None),
+                    )
+
+                except Exception:
+                    logger.warning(
+                        "Operator Zero automatic trust after transfer failed",
+                        call_id=call_id,
+                        caller_number=getattr(session, "caller_number", None),
+                        exc_info=True,
+                    )
+
         return result
 
     def _deferred_transfer_local_handoff_providers(self, session: Optional[CallSession] = None) -> set[str]:

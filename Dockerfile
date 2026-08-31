@@ -29,7 +29,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Ensure IANA timezone support when TZ is set via .env (Admin UI → Environment)
 RUN apt-get -o Acquire::Retries=5 update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        tzdata \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Note: sox/curl/unzip removed - not needed at runtime

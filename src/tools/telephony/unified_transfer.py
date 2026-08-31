@@ -6,6 +6,7 @@ This tool implements the canonical `blind_transfer` tool and replaces the legacy
 """
 
 from typing import Dict, Any, Optional, Tuple, List
+import asyncio
 import structlog
 
 from ..base import Tool, ToolDefinition, ToolParameter, ToolCategory
@@ -55,6 +56,34 @@ class UnifiedTransferTool(Tool):
                         "(matched against destination key/description)."
                     ),
                     required=True
+                ),
+                ToolParameter(
+                    name="caller_name",
+                    type="string",
+                    description=(
+                        "Personal name the caller gave during screening. "
+                        "Include it when known."
+                    ),
+                    required=False
+                ),
+                ToolParameter(
+                    name="company",
+                    type="string",
+                    description=(
+                        "Company, organization, emergency service, hospital, "
+                        "police/fire department, or other organization the "
+                        "caller identified, when known."
+                    ),
+                    required=False
+                ),
+                ToolParameter(
+                    name="recipient",
+                    type="string",
+                    description=(
+                        "Household person or household/family role the caller "
+                        "asked for, when known."
+                    ),
+                    required=False
                 )
             ]
         )
@@ -93,6 +122,7 @@ class UnifiedTransferTool(Tool):
         description: str,
         dialplan_context: str,
         destination_key: Optional[str] = None,
+        screening_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if transfer_deferral_enabled(context):
             try:
@@ -145,6 +175,11 @@ class UnifiedTransferTool(Tool):
             description=description,
             dialplan_context=dialplan_context,
             destination_key=destination_key,
+            payload=(
+                {"operator_zero": dict(screening_metadata)}
+                if screening_metadata
+                else None
+            ),
         )
 
         if transfer_deferral_enabled(context):
@@ -206,6 +241,18 @@ class UnifiedTransferTool(Tool):
             dial_timeout_sec = 30
 
         destination_key = str(action.get("destination_key") or action.get("target") or "").strip()
+
+        action_payload = (
+            action.get("payload")
+            if isinstance(action.get("payload"), dict)
+            else {}
+        )
+        operator_zero_metadata = (
+            action_payload.get("operator_zero")
+            if isinstance(action_payload.get("operator_zero"), dict)
+            else {}
+        )
+
         try:
             session = await context.get_session()
             session.current_action = {
@@ -220,6 +267,15 @@ class UnifiedTransferTool(Tool):
                 "answered": False,
                 "ready_to_bridge": False,
                 "bridged": False,
+                "caller_name": str(
+                    operator_zero_metadata.get("caller_name") or ""
+                ).strip(),
+                "business_name": str(
+                    operator_zero_metadata.get("company") or ""
+                ).strip(),
+                "recipient": str(
+                    operator_zero_metadata.get("recipient") or ""
+                ).strip(),
             }
             await context.session_store.upsert_call(session)
         except Exception:
@@ -281,6 +337,78 @@ class UnifiedTransferTool(Tool):
             predial_channel_id=predial_channel_id,
             destination_key=destination_key,
         )
+
+        # Operator Zero:
+        # Prepare the private announcement while the destination phone is
+        # ringing. This removes OpenAI Speech synthesis latency from the
+        # interval after the household answers.
+        caller_name = str(
+            operator_zero_metadata.get("caller_name") or ""
+        ).strip()
+        business_name = str(
+            operator_zero_metadata.get("company") or ""
+        ).strip()
+
+        if caller_name or business_name:
+            if caller_name and business_name:
+                announcement_identity = f"{caller_name} from {business_name}"
+            else:
+                announcement_identity = caller_name or business_name
+
+            announcement_text = f"{announcement_identity} is on the line."
+
+            engine = getattr(context.ari_client, "engine", None)
+            if engine and hasattr(engine, "_local_ai_server_tts"):
+
+                async def _prepare_operator_zero_announcement():
+                    try:
+                        audio = await engine._local_ai_server_tts(
+                            call_id=context.call_id,
+                            text=announcement_text,
+                            timeout_sec=8.0,
+                        )
+
+                        if not audio:
+                            return
+
+                        cache = getattr(
+                            engine,
+                            "_operator_zero_predial_announcement_cache",
+                            None,
+                        )
+                        if not isinstance(cache, dict):
+                            cache = {}
+                            setattr(
+                                engine,
+                                "_operator_zero_predial_announcement_cache",
+                                cache,
+                            )
+
+                        cache[context.call_id] = {
+                            "text": announcement_text,
+                            "audio": audio,
+                        }
+
+                        logger.info(
+                            "Operator Zero predial announcement prepared while ringing",
+                            call_id=context.call_id,
+                            caller_name=caller_name or None,
+                            business_name=business_name or None,
+                            announcement=announcement_text,
+                            audio_bytes=len(audio),
+                        )
+
+                    except Exception:
+                        logger.warning(
+                            "Operator Zero predial announcement preparation failed",
+                            call_id=context.call_id,
+                            exc_info=True,
+                        )
+
+                asyncio.create_task(
+                    _prepare_operator_zero_announcement(),
+                    name=f"operator-zero-announcement-{context.call_id}",
+                )
 
     async def prepare_or_execute_extension_transfer(
         self,
@@ -398,6 +526,21 @@ class UnifiedTransferTool(Tool):
         """
         # Support both 'destination' (canonical) and 'target' (ElevenLabs uses this)
         destination = parameters.get('destination') or parameters.get('target')
+
+        screening_metadata = {
+            key: str(parameters.get(key) or "").strip()
+            for key in ("caller_name", "company", "recipient")
+            if str(parameters.get(key) or "").strip()
+        }
+
+        if screening_metadata:
+            logger.info(
+                "Operator Zero screening metadata received with transfer",
+                call_id=context.call_id,
+                caller_name=screening_metadata.get("caller_name"),
+                company=screening_metadata.get("company"),
+                recipient=screening_metadata.get("recipient"),
+            )
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}
@@ -510,6 +653,7 @@ class UnifiedTransferTool(Tool):
                 description=description,
                 dialplan_context=dialplan_context,
                 destination_key=str(destination),
+                screening_metadata=screening_metadata,
             )
         elif transfer_type == 'queue':
             return await self._defer_or_commit_transfer(
@@ -520,6 +664,7 @@ class UnifiedTransferTool(Tool):
                 description=description,
                 dialplan_context=dialplan_context,
                 destination_key=str(destination),
+                screening_metadata=screening_metadata,
             )
         elif transfer_type == 'ringgroup':
             return await self._defer_or_commit_transfer(
@@ -530,6 +675,7 @@ class UnifiedTransferTool(Tool):
                 description=description,
                 dialplan_context=dialplan_context,
                 destination_key=str(destination),
+                screening_metadata=screening_metadata,
             )
         else:
             logger.error("Invalid transfer type", type=transfer_type)

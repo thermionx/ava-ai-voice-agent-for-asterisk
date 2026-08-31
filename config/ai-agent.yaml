@@ -9,10 +9,11 @@ asterisk:
 audio_transport: audiosocket
 audiosocket:
   format: slin
-  host: 127.0.0.1
+  host: 0.0.0.0
+  advertise_host: 192.168.1.40
   port: 8090
 barge_in:
-  enabled: true
+  enabled: false
   initial_protection_ms: 200
   min_ms: 250
   energy_threshold: 1000
