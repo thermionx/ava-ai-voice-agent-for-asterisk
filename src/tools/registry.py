@@ -606,6 +606,12 @@ Tool Definitions:
             logger.warning(f"Could not import VoicemailTool: {e}")
 
         try:
+            from src.tools.telephony.check_voicemail import CheckVoicemailTool
+            self.register(CheckVoicemailTool)
+        except ImportError as e:
+            logger.warning(f"Could not import CheckVoicemailTool: {e}")
+
+        try:
             from src.tools.telephony.check_extension_status import CheckExtensionStatusTool
             self.register(CheckExtensionStatusTool)
         except ImportError as e:
