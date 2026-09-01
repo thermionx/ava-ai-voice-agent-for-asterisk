@@ -1208,6 +1208,27 @@ AVA Operator helps MSPs and operators manage AI voice across multiple Asterisk a
 
 ## 📝 License
 
+## Operator Zero
+
+This fork of AVA is also used as the real-time voice-agent engine for
+[Operator Zero](https://github.com/thermionx/OperatorZero), an AI-powered
+household telephone operator.
+
+Operator Zero builds on AVA with household call screening, private caller
+announcements, trusted-caller management, voicemail integration, persistent
+household memory, web/search services, and support for traditional analog
+household telephones.
+
+Operator Zero is the application; AVA provides the underlying real-time
+voice-agent engine and Asterisk integration.
+
+For the complete Operator Zero system and installation instructions, see:
+
+- [Operator Zero](https://github.com/thermionx/OperatorZero)
+- [Operator Zero Mini PC Installation Guide](https://github.com/thermionx/OperatorZero/blob/main/docs/mini-pc-install.md)
+
+---
+
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ---
