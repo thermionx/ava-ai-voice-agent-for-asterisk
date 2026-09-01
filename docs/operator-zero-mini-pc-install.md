@@ -796,6 +796,29 @@ Do not assume `docker compose up -d` alone guarantees that every container will 
 
 # 25. Full reboot test
 
+## Mini PC BIOS power-recovery setting
+
+On the AZW EQ mini used for Operator Zero:
+
+- BIOS vendor: American Megatrends International, LLC.
+- BIOS version: TWMINI206
+- Set `State After G3` to `S0 State`.
+
+With `S0 State`, the mini PC automatically powers itself back on when AC power is restored after an outage.
+
+This was verified with the monitor and keyboard disconnected. The mini successfully cold-booted headless with only power and Ethernet connected.
+
+After the headless cold boot, the following were verified to recover automatically:
+
+- Asterisk: active and enabled
+- Operator Zero memory service: active, enabled, health OK
+- Operator Zero web bridge: active, enabled, health OK
+- Docker: active and enabled
+- `admin_ui`: running
+- `ai_engine`: running
+- `local_ai_server`: running and healthy
+
+
 A production installation is not complete until it survives a reboot.
 
 On the mini:
