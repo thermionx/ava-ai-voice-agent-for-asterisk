@@ -10,7 +10,7 @@ audio_transport: audiosocket
 audiosocket:
   format: slin
   host: 0.0.0.0
-  advertise_host: 192.168.1.40
+  advertise_host: 127.0.0.1
   port: 8090
 barge_in:
   enabled: false

@@ -6905,9 +6905,9 @@ class Engine:
                                 memory_base_url = str(
                                     _os.environ.get(
                                         "OPERATOR_ZERO_MEMORY_URL",
-                                        "http://192.168.1.40:8790",
+                                        "http://127.0.0.1:8790",
                                     )
-                                    or "http://192.168.1.40:8790"
+                                    or "http://127.0.0.1:8790"
                                 ).rstrip("/")
 
                                 lookup_url = (
@@ -9659,9 +9659,9 @@ class Engine:
             base_url = str(
                 _os.environ.get(
                     "OPERATOR_ZERO_MEMORY_URL",
-                    "http://192.168.1.40:8790",
+                    "http://127.0.0.1:8790",
                 )
-                or "http://192.168.1.40:8790"
+                or "http://127.0.0.1:8790"
             ).rstrip("/")
 
             url = base_url + "/caller/accepted"
