@@ -181,6 +181,7 @@ class CallSession:
     current_action: Optional[Dict[str, Any]] = None      # Currently executing action
     transfer_context: Optional[Dict[str, Any]] = None    # Context to pass to transfer target
     pending_deferred_transfer: Optional[Dict[str, Any]] = None  # Transfer action waiting for TTS/audio completion
+    pending_phone_call: Optional[Dict[str, Any]] = None  # Outbound number awaiting household confirmation
     
     # Call history tracking (Milestone 21)
     # Append-only terminal in-call tool-result stream. v7.5.3 adds call_id,
