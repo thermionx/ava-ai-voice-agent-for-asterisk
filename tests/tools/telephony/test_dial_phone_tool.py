@@ -32,6 +32,16 @@ def untrusted_number_lookup(monkeypatch):
 def test_normalize_nanp_number_accepts_common_formats():
     assert normalize_nanp_number("(925) 555-0123") == "9255550123"
     assert normalize_nanp_number("+1 925 555 0123") == "19255550123"
+    assert (
+        normalize_nanp_number("555-0123", default_area_code="415")
+        == "4155550123"
+    )
+
+
+def test_normalize_nanp_number_does_not_expand_without_valid_default_area_code():
+    assert normalize_nanp_number("555-0123") is None
+    assert normalize_nanp_number("555-0123", default_area_code="12") is None
+    assert normalize_nanp_number("555-0123", default_area_code="125") is None
 
 
 @pytest.mark.parametrize(
@@ -58,6 +68,21 @@ async def test_first_invocation_only_stages_and_reads_back(tool, tool_context, s
     assert sample_call_session.pending_phone_call["phone_number"] == "9255550123"
     assert sample_call_session.pending_deferred_transfer is None
     tool_context.ari_client.continue_in_dialplan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_seven_digit_number_uses_private_environment_area_code(
+    tool, tool_context, sample_call_session, monkeypatch
+):
+    monkeypatch.setenv("OPERATOR_ZERO_DEFAULT_AREA_CODE", "415")
+    result = await tool.execute(
+        {"phone_number": "555-0123", "confirmed": False},
+        tool_context,
+    )
+
+    assert result["status"] == "confirmation_required"
+    assert result["phone_number"] == "4155550123"
+    assert sample_call_session.pending_phone_call["phone_number"] == "4155550123"
 
 
 @pytest.mark.asyncio

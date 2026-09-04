@@ -46,12 +46,21 @@ _AFFIRMATIVE_CONFIRMATION = re.compile(
 )
 
 
-def normalize_nanp_number(value: Any) -> Optional[str]:
-    """Return a dialplan-safe 10/11-digit NANP number, or ``None``."""
+def normalize_nanp_number(
+    value: Any,
+    *,
+    default_area_code: Optional[str] = None,
+) -> Optional[str]:
+    """Return a dialplan-safe NANP number, expanding seven local digits."""
     raw = str(value or "").strip()
     if not raw or re.search(r"[A-Za-z]", raw):
         return None
     digits = re.sub(r"\D", "", raw)
+    if len(digits) == 7 and default_area_code:
+        area_code = re.sub(r"\D", "", str(default_area_code))
+        if len(area_code) != 3 or area_code[0] not in "23456789":
+            return None
+        digits = area_code + digits
     national = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
     if len(national) != 10:
         return None
@@ -69,6 +78,14 @@ def spoken_digits(number: str) -> str:
 def _clean_display_name(value: Any) -> str:
     cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
     return re.sub(r"\s+", " ", cleaned).strip()[:120]
+
+
+def _configured_area_code(context: ToolExecutionContext) -> str:
+    cfg = context.get_config_value("tools.dial_phone", {}) or {}
+    return str(
+        cfg.get("default_area_code")
+        or os.environ.get("OPERATOR_ZERO_DEFAULT_AREA_CODE", "")
+    ).strip()
 
 
 def _outbound_history_db_path() -> str:
@@ -258,6 +275,8 @@ class DialPhoneTool(Tool):
                 "Stage or complete a household user's outbound phone call. "
                 "Use this tool—not voicemail or a household transfer—when the user "
                 "asks to call a household member's mobile or cell phone. "
+                "Seven-digit local numbers are expanded with the configured default "
+                "area code. If no default is configured, seven-digit numbers are rejected. "
                 "On the first invocation set confirmed=false; the tool returns the digits "
                 "that must be repeated to the user and asks whether they are correct. "
                 "Only after the user explicitly confirms those digits, invoke again "
@@ -300,7 +319,10 @@ class DialPhoneTool(Tool):
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
         display_name = _clean_display_name(parameters.get("display_name"))
-        number = normalize_nanp_number(parameters.get("phone_number"))
+        number = normalize_nanp_number(
+            parameters.get("phone_number"),
+            default_area_code=_configured_area_code(context),
+        )
         try:
             profile_number = await asyncio.to_thread(
                 _agent_profile_number_for_name,
@@ -509,7 +531,10 @@ class DialPhoneTool(Tool):
         action: Dict[str, Any],
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
-        number = normalize_nanp_number(action.get("target"))
+        number = normalize_nanp_number(
+            action.get("target"),
+            default_area_code=_configured_area_code(context),
+        )
         dialplan_context = str(action.get("dialplan_context") or "").strip()
         if not number or not _SAFE_CONTEXT.fullmatch(dialplan_context):
             return {"status": "failed", "message": "Outbound call target is invalid."}
