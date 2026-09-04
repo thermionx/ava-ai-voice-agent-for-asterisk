@@ -15,6 +15,17 @@ logger = structlog.get_logger(__name__)
 DEFERRED_TRANSFER_RESULT_KEY = "deferred_transfer"
 
 
+def _user_turn_count(history: Any) -> int:
+    if not isinstance(history, (list, tuple)):
+        return 0
+    return sum(
+        1
+        for item in history
+        if isinstance(item, dict)
+        and str(item.get("role") or "").strip().lower() == "user"
+    )
+
+
 def transfer_deferral_enabled(context: ToolExecutionContext) -> bool:
     transfer_cfg = context.get_config_value("tools.transfer") or {}
     if not isinstance(transfer_cfg, dict):
@@ -55,7 +66,14 @@ async def store_pending_deferred_transfer(
     action: Dict[str, Any],
 ) -> None:
     session = await context.get_session()
-    session.pending_deferred_transfer = dict(action)
+    pending = dict(action)
+    # A deferred transfer is valid only for the caller turn that caused it. If
+    # the caller speaks again while the announcement is draining, the old
+    # handoff must not terminate the new request.
+    pending["armed_user_turn_count"] = _user_turn_count(
+        getattr(session, "conversation_history", None)
+    )
+    session.pending_deferred_transfer = pending
     await context.session_store.upsert_call(session)
     logger.info(
         "Deferred transfer armed",
@@ -124,6 +142,27 @@ async def commit_pending_deferred_transfer(
     action = getattr(session, "pending_deferred_transfer", None)
     if not isinstance(action, dict):
         return None
+
+    armed_user_turn_count = action.get("armed_user_turn_count")
+    if isinstance(armed_user_turn_count, int):
+        current_user_turn_count = _user_turn_count(
+            getattr(session, "conversation_history", None)
+        )
+        if current_user_turn_count > armed_user_turn_count:
+            session.pending_deferred_transfer = None
+            await context.session_store.upsert_call(session)
+            logger.warning(
+                "Cancelled stale deferred transfer after new caller turn",
+                call_id=context.call_id,
+                action_id=action.get("id"),
+                source_tool=action.get("source_tool"),
+                armed_user_turn_count=armed_user_turn_count,
+                current_user_turn_count=current_user_turn_count,
+            )
+            return {
+                "status": "cancelled",
+                "message": "Transfer cancelled because the caller made a new request.",
+            }
 
     try:
         logger.info(

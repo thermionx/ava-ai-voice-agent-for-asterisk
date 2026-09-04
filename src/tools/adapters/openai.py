@@ -315,7 +315,24 @@ class OpenAIToolAdapter:
             
             # If tool has a message and AI should speak, add direct instruction to speak it
             # Instructions work in both GA and Beta modes
-            if tool_message:
+            if function_name == "web_search":
+                # The complete search result already exists in conversation as
+                # function_call_output. Repeating it in response instructions can
+                # generate a very long spoken answer and overwhelm real-time call
+                # playback. Directory-assistance answers should be immediately
+                # actionable and short.
+                response_config["instructions"] = (
+                    "Answer the user's web lookup request from the latest tool result. "
+                    "Be concise: for a requested business phone number, say only the "
+                    "business name, location, and phone number, then ask whether to dial it. "
+                    "Use at most two short sentences."
+                )
+                logger.info(
+                    "Using concise web-search speech instructions",
+                    call_id=context.get("call_id"),
+                    function_call_id=call_id,
+                )
+            elif tool_message:
                 # Use direct instruction format like greeting: "Please say: {text}"
                 response_config["instructions"] = f"Please say the following to the user: {tool_message}"
                 logger.info(

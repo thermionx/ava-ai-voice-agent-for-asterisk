@@ -272,6 +272,37 @@ class TestUnifiedTransferTool:
         assert tool_context.session_store.get_by_call_id.return_value.pending_deferred_transfer is None
 
     @pytest.mark.asyncio
+    async def test_new_caller_turn_cancels_stale_pending_transfer(self, tool_context, monkeypatch):
+        session = tool_context.session_store.get_by_call_id.return_value
+        action = {
+            "id": "stale-voicemail-action",
+            "kind": "transfer",
+            "source_tool": "check_voicemail",
+            "commit_tool": "check_voicemail",
+            "transfer_type": "voicemail_main",
+            "target": "s",
+            "armed_user_turn_count": 1,
+        }
+        session.pending_deferred_transfer = dict(action)
+        session.conversation_history = [
+            {"role": "user", "content": "What can you do?"},
+            {"role": "assistant", "content": "I can check voicemail."},
+            {"role": "user", "content": "Call Vada Vee Restaurant."},
+        ]
+        commit = AsyncMock(return_value={"status": "success"})
+        monkeypatch.setattr(
+            deferred_transfer_mod,
+            "commit_deferred_transfer_action",
+            commit,
+        )
+
+        result = await deferred_transfer_mod.commit_pending_deferred_transfer(tool_context)
+
+        assert result["status"] == "cancelled"
+        assert session.pending_deferred_transfer is None
+        commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_successful_pending_deferred_transfer_commit_does_not_resurrect_removed_session(self, tool_context, monkeypatch):
         action = {
             "id": "cleanup-action",

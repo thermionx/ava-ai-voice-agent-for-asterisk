@@ -5,6 +5,7 @@ until caller-facing AI audio has completed, then returns the channel to an
 Asterisk dialplan context where VoiceMailMain owns the interaction.
 """
 
+import re
 from typing import Any, Dict
 
 import structlog
@@ -19,6 +20,23 @@ from .deferred_transfer import (
 
 logger = structlog.get_logger(__name__)
 
+_VOICEMAIL_RETRIEVAL_INTENT = re.compile(
+    r"\b(?:voice\s*mail|messages?)\b",
+    re.IGNORECASE,
+)
+
+
+def _latest_user_utterance(history: Any) -> str:
+    if not isinstance(history, (list, tuple)):
+        return ""
+    for item in reversed(history):
+        if (
+            isinstance(item, dict)
+            and str(item.get("role") or "").strip().lower() == "user"
+        ):
+            return str(item.get("content") or item.get("text") or "").strip()
+    return ""
+
 
 class CheckVoicemailTool(Tool):
 
@@ -30,7 +48,8 @@ class CheckVoicemailTool(Tool):
                 "Open the household voicemail message interface so the user can "
                 "listen to, save, or delete existing voicemail messages. "
                 "Use this when the household user asks to check, play, hear, "
-                "retrieve, or listen to voicemail or messages."
+                "retrieve, or listen to voicemail or messages. Never invoke this "
+                "merely because the assistant mentioned or offered voicemail."
             ),
             category=ToolCategory.TELEPHONY,
             requires_channel=True,
@@ -43,6 +62,23 @@ class CheckVoicemailTool(Tool):
         parameters: Dict[str, Any],
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
+
+        session = await context.get_session()
+        utterance = _latest_user_utterance(
+            getattr(session, "conversation_history", None)
+        )
+        if not _VOICEMAIL_RETRIEVAL_INTENT.search(utterance):
+            logger.warning(
+                "Rejected voicemail retrieval without explicit caller intent",
+                call_id=context.call_id,
+            )
+            return {
+                "status": "error",
+                "message": (
+                    "Voicemail was not opened because the caller did not explicitly "
+                    "ask for voicemail or messages. Continue with the caller's request."
+                ),
+            }
 
         action = build_deferred_transfer_action(
             source_tool="check_voicemail",

@@ -3,13 +3,30 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.tools.telephony import dial_phone as dial_phone_module
 from src.tools.telephony.deferred_transfer import DEFERRED_TRANSFER_RESULT_KEY
-from src.tools.telephony.dial_phone import DialPhoneTool, normalize_nanp_number
+from src.tools.telephony.dial_phone import (
+    DialPhoneTool,
+    ListDialedNumbersTool,
+    list_outbound_calls,
+    normalize_nanp_number,
+    record_outbound_call,
+)
 
 
 @pytest.fixture
 def tool():
     return DialPhoneTool()
+
+
+@pytest.fixture(autouse=True)
+def untrusted_number_lookup(monkeypatch):
+    monkeypatch.setattr(dial_phone_module, "_number_is_trusted", lambda _number: False)
+    monkeypatch.setattr(
+        dial_phone_module,
+        "_number_is_in_agent_profile",
+        lambda _number, _context_name: False,
+    )
 
 
 def test_normalize_nanp_number_accepts_common_formats():
@@ -52,6 +69,156 @@ async def test_first_invocation_marked_confirmed_still_only_stages(tool, tool_co
 
     assert result["status"] == "confirmation_required"
     assert sample_call_session.pending_deferred_transfer is None
+
+
+@pytest.mark.asyncio
+async def test_verified_trusted_number_skips_readback(
+    tool, tool_context, sample_call_session, monkeypatch
+):
+    monkeypatch.setattr(dial_phone_module, "_number_is_trusted", lambda _number: True)
+
+    result = await tool.execute(
+        {"phone_number": "9255550123", "confirmed": False, "display_name": "Pat"},
+        tool_context,
+    )
+
+    assert result["status"] == "success"
+    assert result["message"] == "Calling Pat now."
+    assert result["trusted_number"] is True
+    assert sample_call_session.pending_phone_call is None
+    assert sample_call_session.pending_deferred_transfer is None
+    tool_context.ari_client.continue_in_dialplan.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agent_profile_number_skips_readback(
+    tool, tool_context, sample_call_session, monkeypatch
+):
+    tool_context.context_name = "operator_zero"
+    monkeypatch.setattr(
+        dial_phone_module,
+        "_number_is_in_agent_profile",
+        lambda number, context_name: (
+            number == "9255550123" and context_name == "operator_zero"
+        ),
+    )
+
+    result = await tool.execute(
+        {"phone_number": "9255550123", "confirmed": False, "display_name": "Pat"},
+        tool_context,
+    )
+
+    assert result["status"] == "success"
+    assert result["approval_source"] == "agent_profile"
+    assert sample_call_session.pending_phone_call is None
+    assert sample_call_session.pending_deferred_transfer is None
+    tool_context.ari_client.continue_in_dialplan.assert_awaited_once()
+
+
+def test_agent_profile_lookup_matches_only_active_operator_zero(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "agents.db")
+    with dial_phone_module.sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE agents (slug TEXT, prompt TEXT, is_active INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?, ?, ?)",
+            ("operator_zero", "Brian mobile: 925.555.0123.", 1),
+        )
+    monkeypatch.setenv("OPERATOR_ZERO_AGENTS_DB", db_path)
+
+    assert dial_phone_module._number_is_in_agent_profile(
+        "9255550123", "operator_zero"
+    )
+    assert not dial_phone_module._number_is_in_agent_profile(
+        "9255550123", "operator_zero_incoming"
+    )
+    assert dial_phone_module._agent_profile_number_for_name(
+        "Brian", "operator_zero"
+    ) == "9255550123"
+
+
+def test_agent_profile_lookup_resolves_spoken_nickname_and_mobile_noise(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "agents.db")
+    with dial_phone_module.sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE agents (slug TEXT, prompt TEXT, is_active INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?, ?, ?)",
+            (
+                "operator_zero",
+                "Lilian's mobile number is 925.555.0123.",
+                1,
+            ),
+        )
+    monkeypatch.setenv("OPERATOR_ZERO_AGENTS_DB", db_path)
+
+    assert dial_phone_module._agent_profile_number_for_name(
+        "Little Lili mobile phone", "operator_zero"
+    ) == "9255550123"
+
+
+def test_agent_profile_lookup_fails_closed_for_ambiguous_prefix(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "agents.db")
+    with dial_phone_module.sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE agents (slug TEXT, prompt TEXT, is_active INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?, ?, ?)",
+            (
+                "operator_zero",
+                "Lilian mobile: 925.555.0123.\nLilibeth mobile: 925.555.0199.",
+                1,
+            ),
+        )
+    monkeypatch.setenv("OPERATOR_ZERO_AGENTS_DB", db_path)
+
+    assert (
+        dial_phone_module._agent_profile_number_for_name(
+            "Lili mobile", "operator_zero"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_agent_profile_number_overrides_conflicting_whitelist_number(
+    tool, tool_context, sample_call_session, monkeypatch
+):
+    tool_context.context_name = "operator_zero"
+    monkeypatch.setattr(dial_phone_module, "_number_is_trusted", lambda _number: True)
+    monkeypatch.setattr(
+        dial_phone_module,
+        "_agent_profile_number_for_name",
+        lambda name, context_name: "9255550123",
+    )
+    monkeypatch.setattr(
+        dial_phone_module,
+        "_number_is_in_agent_profile",
+        lambda number, context_name: number == "9255550123",
+    )
+
+    result = await tool.execute(
+        {
+            "phone_number": "9255550199",
+            "confirmed": True,
+            "display_name": "Brian",
+        },
+        tool_context,
+    )
+
+    assert result["status"] == "success"
+    assert result["phone_number"] == "9255550123"
+    tool_context.ari_client.continue_in_dialplan.assert_awaited_once_with(
+        tool_context.caller_channel_id,
+        context="from-house",
+        extension="9255550123",
+        priority=1,
+    )
 
 
 @pytest.mark.asyncio
@@ -145,8 +312,16 @@ async def test_expired_confirmation_fails_closed(tool, tool_context, sample_call
 
 
 @pytest.mark.asyncio
-async def test_commit_revalidates_target_and_continues_in_dialplan(tool, tool_context):
-    action = {"target": "9255550123", "dialplan_context": "from-house"}
+async def test_commit_revalidates_target_continues_and_records_history(
+    tool, tool_context, tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "outbound.db")
+    monkeypatch.setenv("OPERATOR_ZERO_OUTBOUND_HISTORY_DB", db_path)
+    action = {
+        "target": "9255550123",
+        "dialplan_context": "from-house",
+        "payload": {"display_name": "Pat"},
+    }
 
     result = await tool.commit_deferred_action(action, tool_context)
 
@@ -157,6 +332,58 @@ async def test_commit_revalidates_target_and_continues_in_dialplan(tool, tool_co
         extension="9255550123",
         priority=1,
     )
+    calls = list_outbound_calls(db_path, limit=10)
+    assert calls[0]["phone_number"] == "9255550123"
+    assert calls[0]["display_name"] == "Pat"
+
+
+def test_outbound_history_is_append_only_and_newest_first(tmp_path):
+    db_path = str(tmp_path / "outbound.db")
+    record_outbound_call(
+        db_path,
+        phone_number="9255550101",
+        display_name="First",
+        call_id="call-1",
+    )
+    record_outbound_call(
+        db_path,
+        phone_number="9255550102",
+        display_name="Second",
+        call_id="call-2",
+    )
+    record_outbound_call(
+        db_path,
+        phone_number="9255550102",
+        display_name="Duplicate retry",
+        call_id="call-2",
+    )
+
+    calls = list_outbound_calls(db_path, limit=10)
+
+    assert [call["phone_number"] for call in calls] == [
+        "9255550102",
+        "9255550101",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_dialed_numbers_uses_separate_outbound_history(
+    tmp_path, monkeypatch, tool_context
+):
+    db_path = str(tmp_path / "outbound.db")
+    monkeypatch.setenv("OPERATOR_ZERO_OUTBOUND_HISTORY_DB", db_path)
+    record_outbound_call(
+        db_path,
+        phone_number="9255550101",
+        display_name="Pat",
+        call_id="call-1",
+    )
+
+    result = await ListDialedNumbersTool().execute({"limit": 20}, tool_context)
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+    assert result["calls"][0]["display_name"] == "Pat"
 
 
 @pytest.mark.asyncio

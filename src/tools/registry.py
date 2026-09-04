@@ -612,10 +612,11 @@ Tool Definitions:
             logger.warning(f"Could not import CheckVoicemailTool: {e}")
 
         try:
-            from src.tools.telephony.dial_phone import DialPhoneTool
+            from src.tools.telephony.dial_phone import DialPhoneTool, ListDialedNumbersTool
             self.register(DialPhoneTool)
+            self.register(ListDialedNumbersTool)
         except ImportError as e:
-            logger.warning(f"Could not import DialPhoneTool: {e}")
+            logger.warning(f"Could not import outbound phone tools: {e}")
 
         try:
             from src.tools.telephony.check_extension_status import CheckExtensionStatusTool

@@ -826,108 +826,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 'is_ga': self._is_ga,  # Pass API version to adapter for correct response.create format
             }
             
-            # Execute tool via adapter.
-            #
-            # Operator Zero: web searches can occasionally take long enough that
-            # silence sounds like the call has stalled. Run the tool concurrently
-            # and, after five seconds, speak one short filler phrase if the search
-            # is still running.
-            #
-            # Do not disturb the existing response.done/function-call synchronization
-            # below. The filler waits for the parent response to finish before
-            # creating its own spoken Realtime response.
-            tool_task = asyncio.create_task(
-                self.tool_adapter.handle_tool_call_event(event_data, context)
-            )
-
-            slow_filler_task = None
-            slow_filler_spoken = False
-
-            if function_name == "web_search":
-
-                async def _delayed_web_search_filler():
-                    try:
-                        await asyncio.sleep(5.0)
-
-                        # Search already finished -- no filler needed.
-                        if tool_task.done():
-                            return False
-
-                        # A function-call item is not safely committed until its
-                        # parent response reaches response.done.
-                        await self._await_parent_response_done(
-                            event_data,
-                            function_name=function_name,
-                        )
-
-                        if tool_task.done():
-                            return False
-
-                        # Never create a second overlapping Realtime response.
-                        # Normally the parent response is already done by now,
-                        # but give it a short bounded opportunity to clear.
-                        deadline = time.monotonic() + 3.0
-                        while self._pending_response and time.monotonic() < deadline:
-                            await asyncio.sleep(0.05)
-
-                        if self._pending_response or tool_task.done():
-                            return False
-
-                        spoken = await self.speak_text("Still looking...")
-
-                        if spoken:
-                            logger.info(
-                                "Spoke slow web-search filler",
-                                call_id=self._call_id,
-                                function_call_id=function_call_id,
-                                tool=function_name,
-                            )
-
-                        return bool(spoken)
-
-                    except asyncio.CancelledError:
-                        return False
-                    except Exception:
-                        logger.warning(
-                            "Failed to speak slow web-search filler",
-                            call_id=self._call_id,
-                            function_call_id=function_call_id,
-                            exc_info=True,
-                        )
-                        return False
-
-                slow_filler_task = asyncio.create_task(
-                    _delayed_web_search_filler()
-                )
-
-            try:
-                result = await tool_task
-            finally:
-                if slow_filler_task is not None:
-                    if not slow_filler_task.done():
-                        slow_filler_task.cancel()
-
-                    try:
-                        slow_filler_spoken = await slow_filler_task
-                    except asyncio.CancelledError:
-                        slow_filler_spoken = False
-
-            # speak_text() starts a normal OpenAI Realtime audio response.
-            # If the search completed while "Still looking..." is being spoken,
-            # wait for that short response to finish before send_tool_result()
-            # below creates the actual answer response.
-            if slow_filler_spoken:
-                deadline = time.monotonic() + 8.0
-
-                while self._pending_response and time.monotonic() < deadline:
-                    await asyncio.sleep(0.05)
-
-                if self._pending_response:
-                    logger.warning(
-                        "Slow web-search filler did not finish before timeout",
-                        call_id=self._call_id,
-                        function_call_id=function_call_id,
-                    )
+            # Keep one Realtime response lifecycle per tool call. Creating a
+            # second spoken "still looking" response while a web tool is in
+            # flight can close the continuous playback segment before the real
+            # tool response arrives, leaving its audio queued with no consumer.
+            result = await self.tool_adapter.handle_tool_call_event(event_data, context)
 
             # Check if this is a hangup_call tool that will trigger hangup
             if function_name == "hangup_call" and result:

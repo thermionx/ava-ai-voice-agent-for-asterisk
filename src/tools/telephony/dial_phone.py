@@ -7,8 +7,14 @@ Asterisk remains the owner of trunk selection, caller ID, and call progress.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import re
+import sqlite3
 import time
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, Iterable, Optional
 
 import structlog
@@ -23,7 +29,13 @@ from .deferred_transfer import (
 
 logger = structlog.get_logger(__name__)
 
+_OUTBOUND_HISTORY_DB_DEFAULT = "/app/data/operator/outbound_calls.db"
+_AGENTS_DB_DEFAULT = "/app/data/operator/agents.db"
+
 _SAFE_CONTEXT = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_CONTACT_NAME_NOISE = frozenset(
+    {"call", "dial", "little", "mobile", "phone", "please", "the"}
+)
 _NEGATIVE_CONFIRMATION = re.compile(
     r"\b(no|nope|not|wrong|incorrect|change|cancel|don't|do not|stop)\b",
     re.IGNORECASE,
@@ -59,6 +71,164 @@ def _clean_display_name(value: Any) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()[:120]
 
 
+def _outbound_history_db_path() -> str:
+    return str(
+        os.environ.get(
+            "OPERATOR_ZERO_OUTBOUND_HISTORY_DB",
+            _OUTBOUND_HISTORY_DB_DEFAULT,
+        )
+        or _OUTBOUND_HISTORY_DB_DEFAULT
+    )
+
+
+def _initialize_outbound_history(db_path: str) -> None:
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=5) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT NOT NULL,
+                display_name TEXT,
+                call_id TEXT,
+                dialed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_outbound_calls_dialed_at
+            ON outbound_calls(dialed_at DESC, id DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_calls_call_id
+            ON outbound_calls(call_id)
+            WHERE call_id IS NOT NULL AND call_id != ''
+            """
+        )
+        connection.commit()
+
+
+def record_outbound_call(
+    db_path: str,
+    *,
+    phone_number: str,
+    display_name: str,
+    call_id: str,
+) -> None:
+    _initialize_outbound_history(db_path)
+    with sqlite3.connect(db_path, timeout=5) as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO outbound_calls (phone_number, display_name, call_id)
+            VALUES (?, ?, ?)
+            """,
+            (phone_number, display_name, call_id),
+        )
+        connection.commit()
+
+
+def list_outbound_calls(db_path: str, *, limit: int) -> list[Dict[str, Any]]:
+    _initialize_outbound_history(db_path)
+    with sqlite3.connect(db_path, timeout=5) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT id, phone_number, display_name, dialed_at
+            FROM outbound_calls
+            ORDER BY dialed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _number_is_trusted(phone_number: str) -> bool:
+    """Verify dialing-confirmation exemption with Operator Zero memory."""
+    base_url = str(
+        os.environ.get("OPERATOR_ZERO_MEMORY_URL", "http://127.0.0.1:8790")
+        or "http://127.0.0.1:8790"
+    ).rstrip("/")
+    url = f"{base_url}/caller?phone={urllib.parse.quote(phone_number)}"
+    with urllib.request.urlopen(url, timeout=2.0) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    return str(result.get("trusted_caller") or "").strip().lower() == "true"
+
+
+def _number_is_in_agent_profile(phone_number: str, context_name: str) -> bool:
+    """Return whether the active Agent prompt explicitly contains the number."""
+    slug = str(context_name or "").strip()
+    if slug != "operator_zero":
+        return False
+    db_path = str(
+        os.environ.get("OPERATOR_ZERO_AGENTS_DB", _AGENTS_DB_DEFAULT)
+        or _AGENTS_DB_DEFAULT
+    )
+    with sqlite3.connect(db_path, timeout=2) as connection:
+        row = connection.execute(
+            "SELECT prompt FROM agents WHERE slug = ? AND is_active = 1",
+            (slug,),
+        ).fetchone()
+    if not row:
+        return False
+    # Extract phone-shaped runs from the operator-maintained profile, then use
+    # the same strict NANP normalization as the eventual dialplan handoff.
+    candidates = re.findall(r"(?:\+?1[ .()\-]*)?(?:\d[ .()\-]*){10}", str(row[0] or ""))
+    return any(normalize_nanp_number(candidate) == phone_number for candidate in candidates)
+
+
+def _agent_profile_number_for_name(display_name: str, context_name: str) -> Optional[str]:
+    """Resolve a named contact from Operator Zero's profile, if unambiguous."""
+    slug = str(context_name or "").strip()
+    name = _clean_display_name(display_name).casefold()
+    if slug != "operator_zero" or not name:
+        return None
+    db_path = str(
+        os.environ.get("OPERATOR_ZERO_AGENTS_DB", _AGENTS_DB_DEFAULT)
+        or _AGENTS_DB_DEFAULT
+    )
+    with sqlite3.connect(db_path, timeout=2) as connection:
+        row = connection.execute(
+            "SELECT prompt FROM agents WHERE slug = ? AND is_active = 1",
+            (slug,),
+        ).fetchone()
+    if not row:
+        return None
+    requested_tokens = {
+        token
+        for token in re.findall(r"[a-z]+", name)
+        if len(token) >= 4 and token not in _CONTACT_NAME_NOISE
+    }
+    if not requested_tokens:
+        return None
+
+    matches: set[str] = set()
+    for line in str(row[0] or "").splitlines():
+        line_tokens = set(re.findall(r"[a-z]+", line.casefold()))
+        # Spoken-name transcripts commonly shorten a first name (for example,
+        # "Lili" for "Lilian") or add harmless words such as "little" and
+        # "mobile phone". Accept a unique four-letter-or-longer prefix, but
+        # never guess when it identifies more than one profile number.
+        if not any(
+            requested == profile or profile.startswith(requested)
+            for requested in requested_tokens
+            for profile in line_tokens
+        ):
+            continue
+        for candidate in re.findall(
+            r"(?:\+?1[ .()\-]*)?(?:\d[ .()\-]*){10}", line
+        ):
+            normalized = normalize_nanp_number(candidate)
+            if normalized:
+                matches.add(normalized)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def _new_user_messages(history: Iterable[Any], start_index: int) -> list[str]:
     messages: list[str] = []
     for item in list(history or [])[max(0, start_index):]:
@@ -85,12 +255,16 @@ class DialPhoneTool(Tool):
         return ToolDefinition(
             name="dial_phone",
             description=(
-                "Stage or complete a household user's outbound phone call. On the "
-                "first invocation set confirmed=false; the tool returns the digits "
+                "Stage or complete a household user's outbound phone call. "
+                "Use this tool—not voicemail or a household transfer—when the user "
+                "asks to call a household member's mobile or cell phone. "
+                "On the first invocation set confirmed=false; the tool returns the digits "
                 "that must be repeated to the user and asks whether they are correct. "
                 "Only after the user explicitly confirms those digits, invoke again "
                 "with the identical phone_number and confirmed=true. A number may come "
-                "from a trusted-caller lookup, caller-history lookup, or the user's speech."
+                "from directory assistance, a trusted-caller lookup, caller-history "
+                "lookup, or the user's speech. Trusted callers are verified by the tool "
+                "and dialed immediately without number readback."
             ),
             category=ToolCategory.TELEPHONY,
             requires_channel=True,
@@ -125,7 +299,29 @@ class DialPhoneTool(Tool):
         parameters: Dict[str, Any],
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
+        display_name = _clean_display_name(parameters.get("display_name"))
         number = normalize_nanp_number(parameters.get("phone_number"))
+        try:
+            profile_number = await asyncio.to_thread(
+                _agent_profile_number_for_name,
+                display_name,
+                context.context_name,
+            )
+        except Exception:
+            profile_number = None
+            logger.warning(
+                "Named Agent-profile lookup unavailable",
+                call_id=context.call_id,
+            )
+        if profile_number and profile_number != number:
+            logger.warning(
+                "Agent-profile number overrode conflicting dial request",
+                call_id=context.call_id,
+                display_name=display_name,
+                requested_last4=number[-4:] if number else "",
+                profile_last4=profile_number[-4:],
+            )
+            number = profile_number
         if not number:
             return {
                 "status": "error",
@@ -136,7 +332,63 @@ class DialPhoneTool(Tool):
         history = list(getattr(session, "conversation_history", None) or [])
         pending = getattr(session, "pending_phone_call", None)
         confirmed = parameters.get("confirmed") is True
-        display_name = _clean_display_name(parameters.get("display_name"))
+
+        # Operator-managed sources, not the model, own the confirmation
+        # exemption. Any lookup failure falls through to fail-closed readback.
+        if not isinstance(pending, dict):
+            approval_source = ""
+            try:
+                if await asyncio.to_thread(_number_is_trusted, number):
+                    approval_source = "trusted_caller"
+            except Exception:
+                logger.warning(
+                    "Trusted-number lookup unavailable; requiring confirmation",
+                    call_id=context.call_id,
+                    target_last4=number[-4:],
+                )
+            if not approval_source:
+                try:
+                    if await asyncio.to_thread(
+                        _number_is_in_agent_profile,
+                        number,
+                        context.context_name,
+                    ):
+                        approval_source = "agent_profile"
+                except Exception:
+                    logger.warning(
+                        "Agent-profile number lookup unavailable; requiring confirmation",
+                        call_id=context.call_id,
+                        target_last4=number[-4:],
+                    )
+            if approval_source:
+                label = display_name or number
+                action = self._build_dial_action(number, label, context)
+                if not _SAFE_CONTEXT.fullmatch(str(action.get("dialplan_context") or "")):
+                    logger.error(
+                        "Unsafe outbound dialplan context rejected",
+                        call_id=context.call_id,
+                    )
+                    return {
+                        "status": "failed",
+                        "message": "Outbound calling is not configured safely.",
+                    }
+                logger.info(
+                    "Approved outbound phone call starting without readback",
+                    call_id=context.call_id,
+                    target_last4=number[-4:],
+                    approval_source=approval_source,
+                )
+                result = await self.commit_deferred_action(action, context)
+                result.update(
+                    {
+                        "phone_number": number,
+                        "trusted_number": True,
+                        "approval_source": approval_source,
+                    }
+                )
+                if result.get("status") == "success":
+                    result["message"] = f"Calling {label} now."
+                return result
 
         if not confirmed:
             session.pending_phone_call = {
@@ -219,14 +471,7 @@ class DialPhoneTool(Tool):
             return {"status": "failed", "message": "Outbound calling is not configured safely."}
 
         label = str(pending.get("display_name") or display_name or number).strip()[:120]
-        action = build_deferred_transfer_action(
-            source_tool="dial_phone",
-            commit_tool="dial_phone",
-            transfer_type="outbound_phone_call",
-            target=number,
-            description=label,
-            dialplan_context=dialplan_context,
-        )
+        action = self._build_dial_action(number, label, context)
         session.pending_phone_call = None
         await context.session_store.upsert_call(session)
         await store_pending_deferred_transfer(context, action)
@@ -239,6 +484,24 @@ class DialPhoneTool(Tool):
             action=action,
             message=f"Calling {label} now.",
             extra={"phone_number": number},
+        )
+
+    @staticmethod
+    def _build_dial_action(
+        number: str,
+        label: str,
+        context: ToolExecutionContext,
+    ) -> Dict[str, Any]:
+        cfg = context.get_config_value("tools.dial_phone", {}) or {}
+        dialplan_context = str(cfg.get("dialplan_context") or "from-house").strip()
+        return build_deferred_transfer_action(
+            source_tool="dial_phone",
+            commit_tool="dial_phone",
+            transfer_type="outbound_phone_call",
+            target=number,
+            description=label,
+            dialplan_context=dialplan_context,
+            payload={"display_name": label},
         )
 
     async def commit_deferred_action(
@@ -261,6 +524,24 @@ class DialPhoneTool(Tool):
             )
             if continued is not True:
                 raise RuntimeError("Asterisk rejected the outbound dialing handoff")
+            try:
+                payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+                await asyncio.to_thread(
+                    record_outbound_call,
+                    _outbound_history_db_path(),
+                    phone_number=number,
+                    display_name=_clean_display_name(payload.get("display_name")),
+                    call_id=str(context.call_id or ""),
+                )
+            except Exception:
+                # The channel has already left Stasis and may be dialing. History
+                # failure must not falsely report that the phone call failed.
+                logger.error(
+                    "Unable to record outbound call history",
+                    call_id=context.call_id,
+                    target_last4=number[-4:],
+                    exc_info=True,
+                )
             return {
                 "status": "success",
                 "message": "Outbound call started",
@@ -275,3 +556,64 @@ class DialPhoneTool(Tool):
                 exc_info=True,
             )
             return {"status": "failed", "message": "Unable to place that call right now."}
+
+
+class ListDialedNumbersTool(Tool):
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="list_dialed_numbers",
+            description=(
+                "Return the household's outbound dialing history, newest first. "
+                "Use this when the user asks what numbers Operator Zero called, "
+                "who the household called, or for outgoing call history. Do not "
+                "use caller-history tools for outgoing calls."
+            ),
+            category=ToolCategory.TELEPHONY,
+            requires_channel=False,
+            max_execution_time=10,
+            parameters=[
+                ToolParameter(
+                    name="limit",
+                    type="integer",
+                    description="Maximum calls to return, from 1 to 100. Defaults to 20.",
+                    required=False,
+                )
+            ],
+        )
+
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> Dict[str, Any]:
+        try:
+            limit = max(1, min(int(parameters.get("limit", 20)), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            calls = await asyncio.to_thread(
+                list_outbound_calls,
+                _outbound_history_db_path(),
+                limit=limit,
+            )
+        except Exception:
+            logger.error(
+                "Unable to read outbound call history",
+                call_id=context.call_id,
+                exc_info=True,
+            )
+            return {
+                "status": "failed",
+                "message": "Unable to retrieve outgoing call history right now.",
+            }
+        return {
+            "status": "success",
+            "count": len(calls),
+            "calls": calls,
+            "message": (
+                "No outgoing calls have been recorded."
+                if not calls
+                else f"Found {len(calls)} outgoing calls."
+            ),
+        }
