@@ -168,6 +168,53 @@ async def test_speech_started_cannot_flush_openai_greeting_transport_tail(openai
     assert events == []
 
 
+@pytest.mark.asyncio
+async def test_speech_started_immediately_cancels_interruptible_greeting(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    openai_config.greeting_interruptible = True
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-inside-operator-zero"
+    provider._greeting_response_id = "resp-greeting"
+    provider._current_response_id = "resp-greeting"
+    provider._greeting_completed = False
+    provider._pending_response = True
+    provider._cancel_response = AsyncMock()
+    provider._emit_provider_barge_in = AsyncMock()
+
+    await provider._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    provider._cancel_response.assert_awaited_once_with("resp-greeting")
+    provider._emit_provider_barge_in.assert_awaited_once_with(
+        event_type="input_audio_buffer.speech_started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_speech_started_flushes_buffered_interruptible_greeting(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    openai_config.greeting_interruptible = True
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-inside-buffered-greeting"
+    provider._greeting_response_id = "resp-greeting"
+    provider._current_response_id = None
+    provider._greeting_completed = False
+    provider._outbuf.extend(b"buffered-greeting")
+    provider._emit_audio_done = AsyncMock()
+
+    await provider._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    assert provider._outbuf == bytearray()
+    provider._emit_audio_done.assert_awaited_once_with()
+
+
 def _function_call_event(response_id="resp-1", call_id="call-1", name="lookup"):
     return {
         "type": "response.output_item.done",

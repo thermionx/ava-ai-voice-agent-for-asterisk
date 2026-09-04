@@ -18725,6 +18725,9 @@ class Engine:
                                     else greeting_to_apply
                                 ),
                             )
+                        session.provider_overrides["greeting_interruptible"] = bool(
+                            getattr(context_config, "greeting_interruptible", False)
+                        )
                         if context_config.prompt:
                             prompt_to_apply = context_config.prompt
                             # Apply template substitution for caller context variables
@@ -20245,6 +20248,7 @@ class Engine:
             return
 
         greeting = overrides.get("greeting")
+        greeting_interruptible = bool(overrides.get("greeting_interruptible", False))
         prompt = overrides.get("prompt")
         target_encoding = overrides.get("target_encoding")
         target_rate = overrides.get("target_sample_rate_hz")
@@ -20260,6 +20264,7 @@ class Engine:
             if isinstance(cfg, dict):
                 if greeting:
                     cfg["greeting"] = greeting
+                cfg["greeting_interruptible"] = greeting_interruptible
                 if prompt:
                     # Some providers call this "prompt", others "instructions"
                     cfg.setdefault("prompt", prompt)
@@ -20292,6 +20297,10 @@ class Engine:
             else:
                 if greeting and hasattr(cfg, "greeting"):
                     setattr(cfg, "greeting", greeting)
+                if hasattr(cfg, "greeting_interruptible"):
+                    setattr(cfg, "greeting_interruptible", greeting_interruptible)
+                if hasattr(provider, "_greeting_interruptible"):
+                    provider._greeting_interruptible = greeting_interruptible
                 if prompt:
                     if hasattr(cfg, "prompt"):
                         setattr(cfg, "prompt", prompt)

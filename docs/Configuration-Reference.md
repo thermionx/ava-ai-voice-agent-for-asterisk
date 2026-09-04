@@ -654,6 +654,7 @@ Each context supports the following fields:
 
 - `prompt`: System prompt/persona instructions for the AI.
 - `greeting`: Initial greeting spoken when call connects.
+- `greeting_interruptible`: When `true`, caller speech may immediately cancel the initial greeting. Keep the default `false` for screening or compliance-sensitive greetings.
 - `profile`: Audio profile name to use for this context.
 - `provider`: Provider override for this context.
 - `tools`: List of **in-call** tool names to enable for this context.

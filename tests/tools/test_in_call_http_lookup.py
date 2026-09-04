@@ -39,6 +39,7 @@ class TestInCallHTTPConfig:
         assert config.return_raw_json is False
         assert config.max_response_size_bytes == 65536
         assert "sorry" in config.error_message.lower()
+        assert config.error_message_path is None
     
     def test_custom_values(self):
         """Test custom configuration values."""
@@ -349,6 +350,58 @@ class TestInCallHTTPTool:
             result = await tool.execute({"date": "2026-01-30"}, execution_context)
         
         assert result["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_non_200_can_expose_configured_structured_error(self, tool_config, execution_context):
+        """An opted-in JSON error path is returned without exposing other fields."""
+        tool_config.error_message_path = "error"
+        tool = InCallHTTPTool(tool_config)
+        mock_response = AsyncMock()
+        mock_response.status = 500
+        mock_response.headers = {}
+        mock_response.charset = "utf-8"
+        mock_response.content = self._make_content([
+            b'{"error":"Could not locate: WeWork, San Ramon, CA",',
+            b'"internal":"secret diagnostic"}',
+        ])
+        request_cm = AsyncMock()
+        request_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        request_cm.__aexit__ = AsyncMock(return_value=None)
+        session = AsyncMock()
+        session.request = MagicMock(return_value=request_cm)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=session_cm):
+            result = await tool.execute({"date": "2026-01-30"}, execution_context)
+
+        assert result == {
+            "status": "failed",
+            "message": "Could not locate: WeWork, San Ramon, CA",
+        }
+        assert "secret diagnostic" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_non_200_structured_error_is_opt_in(self, tool_config, execution_context):
+        """The existing generic error remains the privacy-preserving default."""
+        tool = InCallHTTPTool(tool_config)
+        mock_response = AsyncMock()
+        mock_response.status = 500
+        mock_response.headers = {}
+        request_cm = AsyncMock()
+        request_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        request_cm.__aexit__ = AsyncMock(return_value=None)
+        session = AsyncMock()
+        session.request = MagicMock(return_value=request_cm)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=session_cm):
+            result = await tool.execute({"date": "2026-01-30"}, execution_context)
+
+        assert result["message"] == tool_config.error_message
     
     @pytest.mark.asyncio
     async def test_request_error_returns_error(self, tool_config, execution_context):
@@ -761,6 +814,7 @@ class TestCreateInCallHTTPTool:
             "return_raw_json": False,
             "max_response_size_bytes": 32768,
             "error_message": "Could not check availability.",
+            "error_message_path": "error.detail",
         }
         
         tool = create_in_call_http_tool("availability_check", config_dict)
@@ -775,3 +829,4 @@ class TestCreateInCallHTTPTool:
         assert tool.config.max_response_size_bytes == 32768
         assert len(tool.config.parameters) == 1
         assert tool.config.error_message == "Could not check availability."
+        assert tool.config.error_message_path == "error.detail"

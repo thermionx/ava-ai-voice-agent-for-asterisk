@@ -82,6 +82,7 @@ class ContextConfig:
     hangup_policy: Optional[Dict[str, Any]] = None  # Per-agent end-call marker override
     background_music: Optional[str] = None  # MOH class name for background music during calls
     connection_audio: Optional[str] = None  # Caller-only ARI media while provider/pipeline connects
+    greeting_interruptible: bool = False  # Allow caller speech to cancel the initial greeting
     
     # Phase tool configuration (Milestone 24)
     pre_call_tools: Optional[List[str]] = None  # Tool names to run after answer, before AI speaks
@@ -284,6 +285,9 @@ class TransportOrchestrator:
                     tools=context_dict.get('tools'),  # In-call tools for function calling
                     background_music=context_dict.get('background_music'),  # MOH class for background music
                     connection_audio=context_dict.get('connection_audio'),  # Caller-only setup/ringback media
+                    greeting_interruptible=(
+                        _coerce_optional_bool(context_dict.get('greeting_interruptible')) is True
+                    ),
                     # Phase tool configuration (Milestone 24)
                     pre_call_tools=context_dict.get('pre_call_tools'),
                     post_call_tools=context_dict.get('post_call_tools'),

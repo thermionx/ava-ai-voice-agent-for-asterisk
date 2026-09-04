@@ -119,6 +119,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._current_response_id: Optional[str] = None  # Track active response for cancellation
         self._greeting_response_id: Optional[str] = None  # Track greeting to protect from barge-in
         self._greeting_completed: bool = False  # Track if greeting has finished
+        self._greeting_interruptible: bool = bool(
+            getattr(config, "greeting_interruptible", False)
+        )
         # GA server VAD cannot be disabled for the greeting. Keep caller input
         # silent until the engine confirms caller-facing transport drain.
         self._greeting_transport_guard_active: bool = False
@@ -631,7 +634,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # When _pacer_underruns > 0, we're just emitting silence - allow input.
             try:
                 if (
-                    not self._greeting_transport_guard_active
+                    not (
+                        self._greeting_interruptible
+                        and self._greeting_response_id
+                        and not self._greeting_completed
+                    )
+                    and not self._greeting_transport_guard_active
                     and self._in_audio_burst
                     and self._pacer_underruns == 0
                 ):
@@ -1342,6 +1350,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         greeting = (self.config.greeting or "").strip()
         if not greeting or not self.websocket or self.websocket.state.name != "OPEN":
             return
+        self._greeting_interruptible = bool(
+            getattr(self.config, "greeting_interruptible", False)
+        )
 
         # Per OpenAI Dec 2024 docs: Disable turn_detection during greeting
         # to prevent user speech from interrupting the greeting
@@ -1395,7 +1406,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         await self._send_json(response_payload)
         # Activate only after response.create is accepted by the websocket.
         # A failed greeting request must not leave caller input muted forever.
-        self._greeting_transport_guard_active = True
+        self._greeting_transport_guard_active = not self._greeting_interruptible
         self._greeting_guard_silence_logged = False
         self._pending_response = True
         
@@ -2212,11 +2223,20 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.debug("Turn latency timer started (speech_stopped)", call_id=self._call_id)
             # Handle barge-in: cancel ongoing response when user starts speaking
             elif event_type == "input_audio_buffer.speech_started" and self._current_response_id:
-                # Protect greeting response from barge-in cancellation
-                if self._greeting_transport_guard_active or (
+                is_active_greeting = (
                     self._current_response_id == self._greeting_response_id
                     and not self._greeting_completed
-                ):
+                )
+                if is_active_greeting and self._greeting_interruptible:
+                    logger.info(
+                        "Caller interrupted interruptible greeting",
+                        call_id=self._call_id,
+                        response_id=self._current_response_id,
+                    )
+                    await self._cancel_response(self._current_response_id)
+                    await self._emit_provider_barge_in(event_type=event_type)
+                # Protect greeting response from barge-in cancellation
+                elif self._greeting_transport_guard_active or is_active_greeting:
                     logger.info(
                         "🛡️  Barge-in blocked - protecting greeting response",
                         call_id=self._call_id,
@@ -2256,8 +2276,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # we still want the platform to flush local playback immediately on speech_started.
                 if event_type == "input_audio_buffer.speech_started":
                     # Never interrupt the greeting turn via platform flush.
-                    if self._greeting_transport_guard_active or (
-                        self._greeting_response_id and not self._greeting_completed
+                    if not self._greeting_interruptible and (
+                        self._greeting_transport_guard_active
+                        or (self._greeting_response_id and not self._greeting_completed)
                     ):
                         logger.info(
                             "🛡️  Barge-in blocked - protecting greeting response",

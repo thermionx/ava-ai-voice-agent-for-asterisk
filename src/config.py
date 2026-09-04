@@ -737,6 +737,7 @@ class OpenAIRealtimeProviderConfig(BaseModel):
     egress_pacer_warmup_ms: int = Field(default=320)
     # Optional explicit greeting to speak immediately on connect
     greeting: Optional[str] = None
+    greeting_interruptible: bool = Field(default=False)
     # Optional server-side turn detection configuration
     # If provided, will be sent in session.update
     class TurnDetectionConfig(BaseModel):

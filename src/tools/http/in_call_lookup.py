@@ -64,6 +64,9 @@ class InCallHTTPConfig:
     
     # Error handling
     error_message: str = "I'm sorry, I couldn't retrieve that information right now."
+    # Opt-in JSON path for a bounded, structured error safe to return to the AI.
+    # Disabled by default so arbitrary upstream bodies are never exposed.
+    error_message_path: Optional[str] = None
 
 
 class InCallHTTPTool(Tool):
@@ -141,6 +144,33 @@ class InCallHTTPTool(Tool):
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    async def _response_error_message(self, response: Any) -> str:
+        """Return an explicitly configured scalar error without exposing raw bodies."""
+        if not self.config.error_message_path:
+            return self.config.error_message
+        try:
+            max_bytes = max(1, min(int(self.config.max_response_size_bytes), 65536))
+            total = 0
+            chunks: list[bytes] = []
+            async for chunk in response.content.iter_chunked(8192):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    return self.config.error_message
+                chunks.append(chunk)
+            charset = getattr(response, "charset", None) or "utf-8"
+            payload = json.loads(b"".join(chunks).decode(charset, errors="replace"))
+            detail = extract_path(payload, self.config.error_message_path)
+            if not isinstance(detail, (str, int, float, bool)):
+                return self.config.error_message
+            # Keep tool output concise and prevent control characters from shaping
+            # the provider conversation beyond one plain-text error sentence.
+            normalized = " ".join(str(detail).split())[:300].strip()
+            return normalized or self.config.error_message
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return self.config.error_message
     
     async def execute(
         self,
@@ -274,7 +304,8 @@ class InCallHTTPTool(Tool):
                             f"In-call HTTP tool returned non-2xx: {self.config.name}",
                             extra={"status": response.status, "call_id": context.call_id}
                         )
-                        if debug_enabled(logger):
+                        message = await self._response_error_message(response)
+                        if debug_enabled(logger) and not self.config.error_message_path:
                             elapsed_ms = round((time.monotonic() - started) * 1000, 2)
                             body_preview = ""
                             try:
@@ -291,7 +322,7 @@ class InCallHTTPTool(Tool):
                             )
                         return {
                             "status": "failed",
-                            "message": self.config.error_message,
+                            "message": message,
                         }
                     
                     # Read body with enforced size limit (do not trust Content-Length header).
@@ -614,6 +645,7 @@ def create_in_call_http_tool(name: str, config_dict: Dict[str, Any]) -> InCallHT
         return_raw_json=config_dict.get('return_raw_json', False),
         max_response_size_bytes=config_dict.get('max_response_size_bytes', 65536),
         error_message=config_dict.get('error_message', "I'm sorry, I couldn't retrieve that information right now."),
+        error_message_path=config_dict.get('error_message_path'),
     )
     
     return InCallHTTPTool(config)

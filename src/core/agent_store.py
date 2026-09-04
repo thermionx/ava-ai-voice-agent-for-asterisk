@@ -16,7 +16,7 @@ from src.tools.telephony.hangup_policy import (
 logger = logging.getLogger(__name__)
 DB_DEFAULT = "/app/data/operator/agents.db"
 
-_EXTRA_FIELDS = ("pipeline","background_music","connection_audio","pre_call_tools","post_call_tools",
+_EXTRA_FIELDS = ("pipeline","background_music","connection_audio","greeting_interruptible","pre_call_tools","post_call_tools",
                  "in_call_http_tools","disable_global_pre_call_tools",
                  "disable_global_in_call_tools","disable_global_post_call_tools",
                  "no_input")
