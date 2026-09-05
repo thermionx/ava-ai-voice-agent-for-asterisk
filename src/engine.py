@@ -21677,26 +21677,10 @@ class Engine:
                 message=result.get("message"),
             )
 
-            # Operator Zero:
-            # A successful deferred transfer to the house is the approval event.
-            # Trust the original outside caller for future calls.
-            if str(result.get("status") or "").strip().lower() == "success":
-                try:
-                    await self._operator_zero_mark_caller_trusted(session)
-
-                    logger.info(
-                        "Operator Zero caller trusted after successful transfer",
-                        call_id=call_id,
-                        caller_number=getattr(session, "caller_number", None),
-                    )
-
-                except Exception:
-                    logger.warning(
-                        "Operator Zero automatic trust after transfer failed",
-                        call_id=call_id,
-                        caller_number=getattr(session, "caller_number", None),
-                        exc_info=True,
-                    )
+            # Do not infer household acceptance from the generic tool result:
+            # voicemail routing is also reported as a successful handoff. The
+            # predial bridge owner marks trust only after announcement playback
+            # completed and the household leg was actually bridged.
 
         return result
 
