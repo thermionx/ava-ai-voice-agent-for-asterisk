@@ -23,6 +23,55 @@ class TestUnifiedTransferTool:
         assert "support_agent" not in definition.description
         assert "sales_agent" not in definition.description
 
+    def test_operator_zero_rejects_recipient_invented_by_model(self, tool):
+        history = [
+            {"role": "user", "content": "I'm Bob."},
+            {"role": "assistant", "content": "Who are you trying to reach?"},
+            {"role": "user", "content": "Oh, yeah."},
+        ]
+
+        error = tool._validate_operator_zero_screening(
+            {"caller_name": "Bob", "recipient": "Lilian"}, history
+        )
+
+        assert error == "The named recipient was not stated by the caller."
+
+    def test_operator_zero_accepts_spoken_caller_and_named_recipient(self, tool):
+        history = [
+            {"role": "user", "content": "This is Bob calling for Lilian."},
+        ]
+
+        assert tool._validate_operator_zero_screening(
+            {"caller_name": "Bob", "recipient": "Lilian"}, history
+        ) is None
+
+    def test_operator_zero_rejects_generic_household_recipient(self, tool):
+        history = [
+            {"role": "user", "content": "I'm Bob. I need the head of household."},
+        ]
+
+        error = tool._validate_operator_zero_screening(
+            {"caller_name": "Bob", "recipient": "head of household"}, history
+        )
+
+        assert "specific named recipient" in error
+
+    def test_operator_zero_accepts_spoken_official_reason(self, tool):
+        history = [
+            {
+                "role": "user",
+                "content": "Lafayette Police calling about an emergency welfare check.",
+            },
+        ]
+
+        assert tool._validate_operator_zero_screening(
+            {
+                "company": "Lafayette Police",
+                "reason": "emergency welfare check",
+            },
+            history,
+        ) is None
+
     @pytest.mark.asyncio
     async def test_resolves_destination_by_description_match(self, tool, tool_context, mock_ari_client):
         tool_context.config["tools"]["transfer"] = {

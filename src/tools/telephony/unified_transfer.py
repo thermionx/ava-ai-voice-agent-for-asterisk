@@ -7,6 +7,7 @@ This tool implements the canonical `blind_transfer` tool and replaces the legacy
 
 from typing import Dict, Any, Optional, Tuple, List
 import asyncio
+import re
 import structlog
 
 from ..base import Tool, ToolDefinition, ToolParameter, ToolCategory
@@ -84,6 +85,15 @@ class UnifiedTransferTool(Tool):
                         "asked for, when known."
                     ),
                     required=False
+                ),
+                ToolParameter(
+                    name="reason",
+                    type="string",
+                    description=(
+                        "Specific emergency or official reason for the call, "
+                        "when the caller is not asking for a named person."
+                    ),
+                    required=False
                 )
             ]
         )
@@ -91,6 +101,70 @@ class UnifiedTransferTool(Tool):
     @staticmethod
     def _normalize_text(value: str) -> str:
         return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
+
+    @classmethod
+    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]]) -> bool:
+        def evidence_text(raw: Any) -> str:
+            return " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
+
+        needle = evidence_text(value)
+        if not needle:
+            return False
+        caller_text = " ".join(
+            evidence_text(message.get("content", ""))
+            for message in history
+            if isinstance(message, dict) and message.get("role") == "user"
+        )
+        return f" {needle} " in f" {caller_text} "
+
+    @classmethod
+    def _validate_operator_zero_screening(
+        cls,
+        metadata: Dict[str, str],
+        history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Fail closed when the model invents incoming-call screening facts."""
+        caller_name = metadata.get("caller_name", "")
+        recipient = metadata.get("recipient", "")
+        company = metadata.get("company", "")
+        reason = metadata.get("reason", "")
+
+        if caller_name and not cls._screening_value_was_spoken(caller_name, history):
+            return "The caller's identity was not confirmed in the conversation."
+
+        generic_recipients = {
+            "household", "household member", "member of the household",
+            "family", "family member", "head of household", "homeowner",
+            "someone there", "anyone there",
+        }
+        recipient_normalized = cls._normalize_text(recipient)
+        named_recipient = bool(recipient_normalized) and recipient_normalized not in generic_recipients
+        if named_recipient:
+            if not caller_name:
+                return "The caller must identify themselves before a household transfer."
+            if not cls._screening_value_was_spoken(recipient, history):
+                return "The named recipient was not stated by the caller."
+            return None
+
+        # The only no-name exception is a caller-stated emergency or official
+        # service purpose. Requiring both fields keeps a bare model assertion
+        # from opening the household transfer boundary.
+        official_terms = {
+            "police", "sheriff", "fire department", "ambulance", "ems",
+            "hospital", "doctor", "medical", "court", "government",
+            "emergency services",
+        }
+        organization_is_official = any(
+            term in cls._normalize_text(company) for term in official_terms
+        )
+        if (
+            organization_is_official
+            and reason
+            and cls._screening_value_was_spoken(company, history)
+            and cls._screening_value_was_spoken(reason, history)
+        ):
+            return None
+        return "A specific named recipient or a confirmed emergency/official reason is required."
 
     @staticmethod
     def _resolve_dialplan_context(
@@ -529,7 +603,7 @@ class UnifiedTransferTool(Tool):
 
         screening_metadata = {
             key: str(parameters.get(key) or "").strip()
-            for key in ("caller_name", "company", "recipient")
+            for key in ("caller_name", "company", "recipient", "reason")
             if str(parameters.get(key) or "").strip()
         }
 
@@ -541,6 +615,21 @@ class UnifiedTransferTool(Tool):
                 company=screening_metadata.get("company"),
                 recipient=screening_metadata.get("recipient"),
             )
+
+        if self._normalize_text(context.context_name or "") == "operator zero incoming":
+            session = await context.get_session()
+            screening_error = self._validate_operator_zero_screening(
+                screening_metadata,
+                list(getattr(session, "conversation_history", None) or []),
+            )
+            if screening_error:
+                logger.warning(
+                    "Operator Zero rejected unsupported incoming transfer",
+                    call_id=context.call_id,
+                    reason=screening_error,
+                    metadata=screening_metadata,
+                )
+                return {"status": "failed", "message": screening_error}
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}

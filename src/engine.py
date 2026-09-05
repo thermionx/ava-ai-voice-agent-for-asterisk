@@ -7145,6 +7145,19 @@ class Engine:
                         exc_info=True,
                     )
 
+                session = await self.session_store.get_by_call_id(call_id) or session
+                latest_action = dict(getattr(session, "current_action", None) or {})
+                if not latest_action.get("private_announcement_played"):
+                    logger.error(
+                        "Operator Zero refusing bridge because private announcement did not complete",
+                        call_id=call_id,
+                        predial_channel_id=predial_channel_id,
+                    )
+                    self._unregister_predial_transfer_channel(predial_channel_id)
+                    with contextlib.suppress(Exception):
+                        await self.ari_client.hangup_channel(predial_channel_id)
+                    break
+
                 ok = await self._finalize_predial_transfer_bridge(session, predial_channel_id)
                 if ok:
                     return {
@@ -8707,12 +8720,27 @@ class Engine:
             if not ok:
                 self._ari_playback_waiters.pop(playback_id, None)
                 return None
+            started_at = time.monotonic()
             try:
-                await asyncio.wait_for(fut, timeout=max(0.1, float(timeout_sec)))
+                playback_state = await asyncio.wait_for(fut, timeout=max(0.1, float(timeout_sec)))
             except asyncio.TimeoutError:
-                pass
+                logger.warning("ARI playback timed out", channel_id=channel_id, playback_id=playback_id)
+                return None
             finally:
                 self._ari_playback_waiters.pop(playback_id, None)
+            elapsed = time.monotonic() - started_at
+            expected_duration = len(audio_bytes) / 8000.0
+            minimum_duration = max(0.05, expected_duration - 0.25)
+            if playback_state != "done" or elapsed < minimum_duration:
+                logger.warning(
+                    "ARI playback did not complete successfully",
+                    channel_id=channel_id,
+                    playback_id=playback_id,
+                    playback_state=playback_state,
+                    elapsed_sec=round(elapsed, 3),
+                    expected_duration_sec=round(expected_duration, 3),
+                )
+                return None
             return playback_id
         except Exception:
             logger.debug("Failed to play ulaw bytes on channel", channel_id=channel_id, exc_info=True)
@@ -21122,7 +21150,7 @@ class Engine:
             waiter = self._ari_playback_waiters.get(playback_id)
             if waiter and not waiter.done():
                 try:
-                    waiter.set_result(True)
+                    waiter.set_result(str(playback.get("state") or "").strip().lower())
                 except Exception:
                     pass
 
