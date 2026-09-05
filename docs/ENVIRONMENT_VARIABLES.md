@@ -35,6 +35,7 @@ Set these in `.env`:
 - `ASTERISK_ARI_SSL_VERIFY`: `true` (default) or `false`. Set `false` only for self-signed certs in non-prod.
 - `ASTERISK_ARI_USERNAME` / `ASTERISK_ARI_PASSWORD`: ARI credentials (secrets).
 - `ASTERISK_UID` / `ASTERISK_GID`: align container permissions with your Asterisk user/group (needed for shared media mounts on some hosts).
+- `ASTERISK_MEDIA_PATH`: host path mounted at `/mnt/asterisk_media`; use `/var/lib/asterisk/sounds` when Asterisk runs directly on the Docker host.
 
 ### Provider credentials (env-only)
 

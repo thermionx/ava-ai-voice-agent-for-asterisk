@@ -37,7 +37,7 @@ services:
       - ./config:/app/config
       - ./scripts:/app/scripts
       - ./models:/app/models
-      - ./asterisk_media:/mnt/asterisk_media
+      - ${ASTERISK_MEDIA_PATH:-./asterisk_media}:/mnt/asterisk_media
       - ./data:/app/data
       - ./secrets:/app/project/secrets  # Vertex AI service account credentials
     env_file:
@@ -172,7 +172,7 @@ services:
       # The admin-ui image installs Docker CLI + Compose plugin internally.
       # Optional fallback (host binaries): use `docker compose -f docker-compose.yml -f docker-compose.admin-ui-host-binaries.yml up -d admin_ui`
       - /etc/os-release:/host/etc/os-release:ro
-      - ./asterisk_media:/mnt/asterisk_media
+      - ${ASTERISK_MEDIA_PATH:-./asterisk_media}:/mnt/asterisk_media
       - ./data:/app/data
       - ${ASTERISK_RECORDING_PATH:-/var/spool/asterisk/monitor}:/mnt/asterisk_recordings:ro
     env_file:
