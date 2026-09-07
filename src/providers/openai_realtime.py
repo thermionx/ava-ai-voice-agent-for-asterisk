@@ -143,6 +143,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # in turn causes the LLM to retry and duplicate side-effectful tool calls (e.g. creating
         # multiple calendar events). See _handle_function_call() for the wait logic.
         self._response_done_events: dict[str, asyncio.Event] = {}
+        # Tool requests can precede transcription for the same caller audio.
+        self._input_transcription_events: dict[str, asyncio.Event] = {}
+        self._failed_input_transcriptions: set[str] = set()
+        self._latest_input_audio_item: Optional[str] = None
         # Recently-observed function_call IDs (call_id -> monotonic timestamp). Used by the
         # top-level error handler to decide whether an "invalid_tool_call_id" from the server
         # refers to a known-benign race we just waited through (downgrade to warning) or to
@@ -796,6 +800,28 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 timeout_s=timeout,
             )
 
+    async def _await_operator_zero_input_transcripts(self, timeout: float = 3.0) -> None:
+        latest_item = self._latest_input_audio_item
+        pending = {item_id: event for item_id, event in self._input_transcription_events.items() if not event.is_set()}
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in pending.values())), timeout=timeout
+                )
+            except asyncio.TimeoutError as exc:
+                # A missing old transcript must not block every future retry.
+                # This turn remains rejected until a transcript or new turn
+                # arrives; fresh requests still undergo evidence validation.
+                for item_id, event in pending.items():
+                    if not event.is_set():
+                        self._failed_input_transcriptions.add(item_id)
+                        event.set()
+                raise RuntimeError("Caller transcription is not ready; ask the caller to repeat before transferring.") from exc
+        if latest_item in self._failed_input_transcriptions:
+            raise RuntimeError("Caller transcription failed; ask the caller to repeat before transferring.")
+        if latest_item != self._latest_input_audio_item or self._closing or self._closed:
+            raise RuntimeError("Caller turn changed or call ended before transfer validation.")
+
     async def _handle_function_call(self, event_data: Dict[str, Any]):
         """
         Handle function call request from OpenAI Realtime API.
@@ -838,6 +864,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # second spoken "still looking" response while a web tool is in
             # flight can close the continuous playback segment before the real
             # tool response arrives, leaving its audio queued with no consumer.
+            if (
+                getattr(self, "_context_name", None) == "operator_zero_incoming"
+                and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer"
+            ):
+                await self._await_operator_zero_input_transcripts()
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)
 
             # Check if this is a hangup_call tool that will trigger hangup
@@ -1061,6 +1092,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 for _evt in self._response_done_events.values():
                     _evt.set()
                 self._response_done_events.clear()
+                for event in self._input_transcription_events.values():
+                    event.set()
+                self._input_transcription_events.clear()
+                self._failed_input_transcriptions.clear()
+                self._latest_input_audio_item = None
             except Exception:
                 logger.debug("Failed to release response.done sentinels on stop_session", exc_info=True)
             self.websocket = None
@@ -1838,6 +1874,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
     async def _handle_event(self, event: Dict[str, Any]):
         event_type = event.get("type")
+        if event_type in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
+            item_id = event.get("item_id")
+            if item_id:
+                self._latest_input_audio_item = item_id
+                self._input_transcription_events.setdefault(item_id, asyncio.Event())
 
         # Log top-level error events with full payload to diagnose API contract issues
         if event_type == "error":
@@ -2189,9 +2230,22 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 await self._emit_transcript(transcript, is_final=True)
                 # Track user conversation for email tools and call history
                 await self._track_conversation("user", transcript)
+            # _emit_transcript above awaits the engine's history update before
+            # releasing transfer validation and the deferred-turn snapshot.
+            item_id = event.get("item_id")
+            if item_id:
+                if not transcript:
+                    self._failed_input_transcriptions.add(item_id)
+                else:
+                    self._failed_input_transcriptions.discard(item_id)
+                self._input_transcription_events.setdefault(item_id, asyncio.Event()).set()
             return
         
         if event_type == "conversation.item.input_audio_transcription.failed":
+            item_id = event.get("item_id")
+            if item_id:
+                self._failed_input_transcriptions.add(item_id)
+                self._input_transcription_events.setdefault(item_id, asyncio.Event()).set()
             # Transcription failed - log but don't crash
             error = event.get("error", {})
             logger.warning(
@@ -2809,6 +2863,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             for _evt in self._response_done_events.values():
                 _evt.set()
             self._response_done_events.clear()
+            for event in self._input_transcription_events.values():
+                event.set()
+            self._input_transcription_events.clear()
+            self._failed_input_transcriptions.clear()
+            self._latest_input_audio_item = None
         except Exception:
             logger.debug("Failed to release response.done sentinels on reconnect", exc_info=True)
         backoff = 0.5

@@ -73,7 +73,7 @@ async def test_greeting_audio_done_defers_tts_gating_until_transport_drain(opena
 
 
 @pytest.mark.asyncio
-async def test_greeting_transport_guard_sends_silence_until_engine_releases(openai_config):
+async def test_greeting_transport_guard_preserves_caller_audio(openai_config):
     provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
     provider._call_id = "call-greeting-input-guard"
     provider.websocket = _OpenWebSocket()
@@ -89,7 +89,9 @@ async def test_greeting_transport_guard_sends_silence_until_engine_releases(open
         encoding="linear16",
     )
 
-    provider._send_audio_to_openai.assert_awaited_once_with(b"\x00" * len(caller_audio))
+    # Caller speech near the greeting boundary must reach the provider intact.
+    # Separate speech_started tests enforce protection from greeting cancellation.
+    provider._send_audio_to_openai.assert_awaited_once_with(caller_audio)
 
 
 @pytest.mark.asyncio
@@ -618,3 +620,94 @@ async def test_error_tool_output_waits_for_parent_response_done(openai_config):
     assert session.conversation_history == []
     assert session.tool_calls[0]["tool_call_id"] == "call-error"
     assert session.tool_calls[0]["status"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_operator_zero_transfer_waits_for_transcript_before_validation_and_arming(openai_config, monkeypatch):
+    from src.tools.telephony.unified_transfer import UnifiedTransferTool
+    from src.tools.telephony import deferred_transfer
+
+    session = SimpleNamespace(conversation_history=[{"role": "user", "content": "This is Bob."}], pending_deferred_transfer=None)
+    store = SimpleNamespace(get_by_call_id=AsyncMock(return_value=session), upsert_call=AsyncMock())
+    context = SimpleNamespace(call_id="transcript-race", get_session=AsyncMock(return_value=session), session_store=store)
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._context_name = "operator_zero_incoming"
+    provider._track_conversation = AsyncMock()
+
+    async def persist_transcript(text, **kwargs):
+        session.conversation_history.append({"role": "user", "content": text})
+    provider._emit_transcript = persist_transcript
+
+    async def execute(event, provider_context):
+        assert UnifiedTransferTool._validate_operator_zero_screening(
+            {"caller_name": "Bob", "recipient": "Brian"}, session.conversation_history
+        ) is None
+        await deferred_transfer.store_pending_deferred_transfer(context, {"id": "transfer-1", "kind": "transfer"})
+        return {"status": "success"}
+    adapter = SimpleNamespace(handle_tool_call_event=AsyncMock(side_effect=execute), send_tool_result=AsyncMock())
+    provider.tool_adapter = adapter
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "request-brian"})
+    task = asyncio.create_task(provider._handle_function_call({"item": {"type": "function_call", "name": "blind_transfer", "call_id": "tool-1", "arguments": "{}"}}))
+    await asyncio.sleep(0)
+    adapter.handle_tool_call_event.assert_not_awaited()
+    await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "request-brian", "transcript": "I'm looking for Brian."})
+    await asyncio.wait_for(task, 1)
+    adapter.handle_tool_call_event.assert_awaited_once()
+    assert session.pending_deferred_transfer["armed_user_turn_count"] == 2
+    commit = AsyncMock(return_value={"status": "success"})
+    monkeypatch.setattr(deferred_transfer, "commit_deferred_transfer_action", commit)
+    result = await deferred_transfer.commit_pending_deferred_transfer(context)
+    assert result == {"status": "success"}
+    commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["timeout", "failed", "empty"])
+async def test_operator_zero_transcript_gate_fails_closed(openai_config, outcome):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "missing"})
+    if outcome != "timeout":
+        await provider._handle_event({"type": "conversation.item.input_audio_transcription." + ("failed" if outcome == "failed" else "completed"), "item_id": "missing", "transcript": ""})
+    with pytest.raises(RuntimeError, match="transcription"):
+        await provider._await_operator_zero_input_transcripts(timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_operator_zero_transcript_gate_rejects_new_turn_during_wait(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._emit_transcript = AsyncMock()
+    provider._track_conversation = AsyncMock()
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "old"})
+    task = asyncio.create_task(provider._await_operator_zero_input_transcripts())
+    await asyncio.sleep(0)
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "new"})
+    await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "old", "transcript": "Brian"})
+    with pytest.raises(RuntimeError, match="turn changed"):
+        await asyncio.wait_for(task, 1)
+
+
+@pytest.mark.asyncio
+async def test_operator_zero_can_retry_after_missing_transcript(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._emit_transcript = AsyncMock()
+    provider._track_conversation = AsyncMock()
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "lost"})
+    with pytest.raises(RuntimeError, match="not ready"):
+        await provider._await_operator_zero_input_transcripts(timeout=0.01)
+    with pytest.raises(RuntimeError, match="failed"):
+        await provider._await_operator_zero_input_transcripts(timeout=0.01)
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "retry"})
+    await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "retry", "transcript": "I'm Bob. I'm looking for Brian."})
+    await provider._await_operator_zero_input_transcripts(timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_operator_zero_transcript_waiter_cancels_without_executing_tool(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "pending"})
+    task = asyncio.create_task(provider._await_operator_zero_input_transcripts())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not provider._input_transcription_events["pending"].is_set()

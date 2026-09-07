@@ -37,8 +37,11 @@ class _StubPipelineOrchestrator:
 
 
 @pytest.mark.unit
-async def test_engine_start_does_not_fail_when_ari_unavailable_at_startup():
+async def test_engine_start_does_not_fail_when_ari_unavailable_at_startup(tmp_path, monkeypatch):
     """Engine.start() should schedule ARI reconnect even if ARI is down."""
+    # Exercise startup migration against this test's own store, never a database
+    # left behind by a previous suite run or a local deployment.
+    monkeypatch.setenv("AGENTS_DB_PATH", str(tmp_path / "agents.db"))
     engine = Engine.__new__(Engine)
     engine.providers = {}
     engine._call_providers = {}

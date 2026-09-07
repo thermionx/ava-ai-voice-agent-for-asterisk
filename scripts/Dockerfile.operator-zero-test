@@ -1,0 +1,16 @@
+# Disposable regression environment; never use this image for live calls.
+ARG RUNTIME_IMAGE=asterisk-ai-voice-agent-ai-engine:latest
+FROM ${RUNTIME_IMAGE}
+USER root
+# Update-script tests use a restricted PATH containing /usr/bin, so they need
+# system python3 as well as the application's /opt/venv interpreter.
+RUN apt-get update && apt-get install -y --no-install-recommends git python3 \
+    && rm -rf /var/lib/apt/lists/*
+# The disposable host checkout is owned by the host user, while tests run as
+# container root. Trust only this fixed mount point for the tracked-file scan.
+RUN git config --global --add safe.directory /app
+COPY requirements-dev.txt /tmp/requirements-dev.txt
+RUN /opt/venv/bin/python -m pip install --no-cache-dir -r /tmp/requirements-dev.txt
+WORKDIR /app
+ENTRYPOINT ["/bin/sh"]
+CMD ["./test-operator-zero"]

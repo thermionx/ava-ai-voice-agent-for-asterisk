@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$repo_dir"
+
+if [ -x .venv/bin/python ] && .venv/bin/python -m pytest --version >/dev/null 2>&1; then
+    python_cmd=.venv/bin/python
+elif [ -x /opt/venv/bin/python ] && /opt/venv/bin/python -m pytest --version >/dev/null 2>&1; then
+    python_cmd=/opt/venv/bin/python
+elif python3 -m pytest --version >/dev/null 2>&1; then
+    python_cmd=python3
+else
+    echo "Operator Zero regression prerequisites are missing." >&2
+    echo "Create .venv and install requirements.txt plus requirements-dev.txt." >&2
+    exit 2
+fi
+
+exec "$python_cmd" -m pytest -q "$@"

@@ -81,6 +81,7 @@ from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
+from .core.operator_zero_state import OperatorZeroTransferState
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
@@ -632,6 +633,10 @@ class Engine:
         self._terminal_hangup_locks: Dict[str, asyncio.Lock] = {}
         self._terminal_hangup_started: Set[str] = set()
         self._terminal_fallback_tasks: Dict[str, asyncio.Task] = {}
+        # Serialize announcement and bridge ownership per predial call.  The
+        # action state remains persisted, while this lock prevents concurrent
+        # finalize events from treating "started" as "completed".
+        self._operator_zero_predial_locks: Dict[str, asyncio.Lock] = {}
         # A rejected VICIdial leg may survive a failed ARI DELETE after the
         # call session is cleaned up. Keep an independent owner retrying that
         # exact channel until Asterisk accepts the hangup or reports it gone.
@@ -6770,8 +6775,11 @@ class Engine:
             await self.ari_client.hangup_channel(channel_id)
             return
 
-        action["answered"] = True
-        action["predial_channel_id"] = channel_id
+        if action.get("operator_zero_phase"):
+            action = OperatorZeroTransferState.load(action).destination_answered(channel_id).action
+        else:
+            action["answered"] = True
+            action["predial_channel_id"] = channel_id
         if destination_key and not action.get("destination_key"):
             action["destination_key"] = destination_key
         session.current_action = action
@@ -6826,7 +6834,10 @@ class Engine:
         if current.get("type") != "predial_transfer":
             return {"status": "failed", "message": "Predial transfer state is no longer active."}
 
-        current["ready_to_bridge"] = True
+        if current.get("operator_zero_phase"):
+            current = OperatorZeroTransferState.load(current).caller_audio_drained().action
+        else:
+            current["ready_to_bridge"] = True
         session.current_action = current
         await self._save_session(session)
 
@@ -6837,6 +6848,8 @@ class Engine:
             if not session:
                 return {"status": "failed", "message": "Call session ended before predial transfer completed."}
             current = dict(getattr(session, "current_action", None) or {})
+            if current.get("operator_zero_terminal") or getattr(session, "cleanup_in_progress", False):
+                return {"status": "failed", "message": "Private announcement handoff ended."}
             predial_channel_id = str(
                 current.get("predial_channel_id")
                 or ((action.get("payload") or {}).get("predial") or {}).get("channel_id")
@@ -6854,17 +6867,28 @@ class Engine:
                 # This is the single owner of the answered predial path.
                 # The answer event records state only; all private announcement,
                 # bridge, and caller-approval work happens here.
-                try:
-                    latest_action = dict(
-                        getattr(session, "current_action", None) or {}
-                    )
-
-                    if not latest_action.get("private_announcement_played"):
-                        # Claim this announcement synchronously before any TTS
-                        # or identity-extraction awaits, preventing replay.
-                        latest_action["private_announcement_played"] = True
-                        session.current_action = latest_action
+                announcement_owner = False
+                announcement_lock = self._operator_zero_predial_locks.setdefault(
+                    call_id, asyncio.Lock()
+                )
+                async with announcement_lock:
+                    session = await self.session_store.get_by_call_id(call_id) or session
+                    latest_action = dict(getattr(session, "current_action", None) or {})
+                    announcement_state = OperatorZeroTransferState.load(latest_action)
+                    if not announcement_state.action.get("private_announcement_started"):
+                        announcement_state = announcement_state.announcement_started()
+                        session.current_action = announcement_state.action
                         await self._save_session(session)
+                        announcement_owner = True
+
+                # Another finalize event owns the announcement. Wait for its
+                # persisted completion instead of bridging on a claim flag.
+                if not announcement_owner and not announcement_state.announcement_complete:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                try:
+                    if announcement_owner:
 
                         spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(
                             session
@@ -7104,6 +7128,20 @@ class Engine:
                         announcement_completed = False
 
                         if announcement_audio:
+                            # Once private playback is requested, this screening
+                            # attempt may only connect or end, never return to AI
+                            # or voicemail. Persist before the playback await so
+                            # household hangup events see the same boundary.
+                            latest = await self.session_store.get_by_call_id(call_id)
+                            if not latest or getattr(latest, "cleanup_in_progress", False):
+                                return {"status": "failed", "message": "Call ended before private announcement."}
+                            if latest.context_name == "operator_zero_incoming":
+                                latest_action = dict(latest.current_action or {})
+                                if latest_action.get("type") != "predial_transfer":
+                                    return {"status": "failed", "message": "Transfer ended before private announcement."}
+                                latest_action["private_announcement_playback_started"] = True
+                                latest.current_action = latest_action
+                                await self._save_session(latest)
                             played_id = await self._play_ulaw_bytes_on_channel_and_wait(
                                 channel_id=predial_channel_id,
                                 audio_bytes=announcement_audio,
@@ -7126,16 +7164,21 @@ class Engine:
                                 caller_name=caller_name,
                             )
 
-                        session = await self.session_store.get_by_call_id(call_id) or session
+                        session = await self.session_store.get_by_call_id(call_id)
+                        if not session or getattr(session, "cleanup_in_progress", False):
+                            return {"status": "failed", "message": "Call ended during private announcement."}
                         latest_action = dict(
                             getattr(session, "current_action", None) or {}
                         )
 
+                        if latest_action.get("operator_zero_terminal"):
+                            return {"status": "failed", "message": "Private announcement handoff ended."}
                         if latest_action.get("type") == "predial_transfer":
-                            latest_action["private_announcement_played"] = (
-                                announcement_completed
+                            session.current_action = (
+                                OperatorZeroTransferState.load(latest_action)
+                                .announcement_finished(announcement_completed)
+                                .action
                             )
-                            session.current_action = latest_action
                             await self._save_session(session)
 
                 except Exception:
@@ -7144,15 +7187,27 @@ class Engine:
                         call_id=call_id,
                         exc_info=True,
                     )
+                    session = await self.session_store.get_by_call_id(call_id) or session
+                    latest_action = dict(getattr(session, "current_action", None) or {})
+                    if latest_action.get("type") == "predial_transfer":
+                        session.current_action = (
+                            OperatorZeroTransferState.load(latest_action).failed().action
+                        )
+                        await self._save_session(session)
 
                 session = await self.session_store.get_by_call_id(call_id) or session
                 latest_action = dict(getattr(session, "current_action", None) or {})
-                if not latest_action.get("private_announcement_played"):
+                if latest_action.get("operator_zero_terminal") or getattr(session, "cleanup_in_progress", False):
+                    return {"status": "failed", "message": "Private announcement handoff ended."}
+                if not OperatorZeroTransferState.load(latest_action).announcement_complete:
                     logger.error(
                         "Operator Zero refusing bridge because private announcement did not complete",
                         call_id=call_id,
                         predial_channel_id=predial_channel_id,
                     )
+                    if latest_action.get("private_announcement_playback_started"):
+                        await self._end_operator_zero_private_handoff(session)
+                        return {"status": "failed", "message": "Private announcement failed; call ended."}
                     self._unregister_predial_transfer_channel(predial_channel_id)
                     with contextlib.suppress(Exception):
                         await self.ari_client.hangup_channel(predial_channel_id)
@@ -7167,6 +7222,8 @@ class Engine:
                         "type": current.get("transfer_type") or action.get("transfer_type"),
                         "strategy": "predial_then_bridge",
                     }
+                if latest_action.get("private_announcement_playback_started"):
+                    await self._end_operator_zero_private_handoff(session)
                 return {"status": "failed", "message": "Predial destination answered, but bridging failed."}
 
             # The outside caller channel is already answered, so ARI /ring
@@ -7219,6 +7276,9 @@ class Engine:
 
         session = await self.session_store.get_by_call_id(call_id)
         current = dict(getattr(session, "current_action", None) or {}) if session else {}
+        if current.get("private_announcement_playback_started"):
+            await self._end_operator_zero_private_handoff(session)
+            return {"status": "failed", "message": "Private announcement handoff timed out; call ended."}
         predial_channel_id = str(current.get("predial_channel_id") or "").strip()
         if predial_channel_id:
             self._unregister_predial_transfer_channel(predial_channel_id)
@@ -7396,6 +7456,8 @@ class Engine:
     async def _finalize_predial_transfer_bridge(self, session: "CallSession", predial_channel_id: str) -> bool:
         call_id = session.call_id
         action = dict(getattr(session, "current_action", None) or {})
+        if action.get("operator_zero_terminal") or getattr(session, "cleanup_in_progress", False):
+            return False
         if action.get("bridged"):
             return True
 
@@ -7491,6 +7553,12 @@ class Engine:
                 session.current_action = action
                 session.transfer_state = "bridged"
                 session.transfer_destination = str(action.get("target_name") or action.get("target") or "")
+                if session.current_action.get("operator_zero_phase"):
+                    session.current_action = (
+                        OperatorZeroTransferState.load(session.current_action)
+                        .bridge_finished(True)
+                        .action
+                    )
                 await self._save_session(session)
             except Exception:
                 logger.debug("Failed to persist predial transfer bridge state", call_id=call_id, exc_info=True)
@@ -7506,9 +7574,14 @@ class Engine:
                     getattr(session, "current_action", None) or {}
                 )
 
-                announcement_completed = bool(
-                    approval_action.get("private_announcement_played")
-                )
+                if approval_action.get("operator_zero_phase"):
+                    announcement_completed = (
+                        OperatorZeroTransferState.load(approval_action).trust_eligible
+                    )
+                else:
+                    announcement_completed = bool(
+                        approval_action.get("private_announcement_played")
+                    )
 
                 if announcement_completed:
                     await self._operator_zero_mark_caller_trusted(session)
@@ -7551,6 +7624,26 @@ class Engine:
         finally:
             bridge_guard.discard(call_id)
 
+    async def _end_operator_zero_private_handoff(self, session: "CallSession") -> None:
+        """End both sides after the private-announcement cutoff, without trust."""
+        latest = await self.session_store.get_by_call_id(session.call_id)
+        if not latest or getattr(latest, "cleanup_in_progress", False):
+            return
+        session = latest
+        action = dict(session.current_action or {})
+        action["operator_zero_terminal"] = True
+        action["private_announcement_played"] = False
+        if action.get("operator_zero_phase"):
+            action = OperatorZeroTransferState.load(action).failed().action
+        session.current_action = action
+        session.pending_deferred_transfer = None
+        session.transfer_active = False
+        await self._save_session(session)
+        # End caller audio before cleanup cancels provider/background work.
+        with contextlib.suppress(Exception):
+            await self.ari_client.hangup_channel(session.caller_channel_id)
+        await self._cleanup_call(session.call_id, force_caller_hangup=True)
+
     async def _handle_unbridged_predial_transfer_channel_end(self, session: "CallSession", predial_channel_id: str) -> None:
         """Handle a predial destination leg ending before it is bridged to the caller."""
         call_id = session.call_id
@@ -7558,6 +7651,9 @@ class Engine:
         try:
             latest = await self.session_store.get_by_call_id(call_id) or session
             action = dict(getattr(latest, "current_action", None) or {})
+            if action.get("private_announcement_playback_started") and not action.get("bridged"):
+                await self._end_operator_zero_private_handoff(latest)
+                return
             if action.get("type") == "predial_transfer" and not action.get("bridged"):
                 latest.current_action = None
                 await self._save_session(latest)
@@ -10746,6 +10842,7 @@ class Engine:
                 self._terminal_hangup_locks.pop(call_id, None)
                 self._terminal_hangup_started.discard(call_id)
                 self._local_tts_farewell_pending.discard(call_id)
+                self._operator_zero_predial_locks.pop(call_id, None)
             except Exception:
                 logger.debug("Terminal lifecycle cleanup failed", call_id=call_id, exc_info=True)
             bg_tasks = self._call_bg_tasks.pop(call_id, set())

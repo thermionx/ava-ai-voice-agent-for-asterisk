@@ -15,11 +15,11 @@ from src.tools.telephony.dial_phone import (
 
 
 @pytest.fixture
-def tool():
+def tool(untrusted_number_lookup):
     return DialPhoneTool()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def untrusted_number_lookup(monkeypatch):
     monkeypatch.setattr(dial_phone_module, "_number_is_trusted", lambda _number: False)
     monkeypatch.setattr(
@@ -161,6 +161,14 @@ def test_agent_profile_lookup_matches_only_active_operator_zero(tmp_path, monkey
     assert dial_phone_module._agent_profile_number_for_name(
         "Brian", "operator_zero"
     ) == "9255550123"
+    assert not dial_phone_module._number_is_in_agent_profile(
+        "9255550199", "operator_zero"
+    )
+    with dial_phone_module.sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE agents SET is_active = 0")
+    assert not dial_phone_module._number_is_in_agent_profile(
+        "9255550123", "operator_zero"
+    )
 
 
 def test_agent_profile_lookup_resolves_spoken_nickname_and_mobile_noise(
@@ -303,7 +311,10 @@ async def test_confirmed_same_number_arms_deferred_dialplan_handoff(
     assert action["target"] == "9255550123"
     assert action["dialplan_context"] == "from-house"
     assert sample_call_session.pending_phone_call is None
-    assert sample_call_session.pending_deferred_transfer == action
+    assert sample_call_session.pending_deferred_transfer == {
+        **action,
+        "armed_user_turn_count": 2,
+    }
     tool_context.ari_client.continue_in_dialplan.assert_not_awaited()
 
 

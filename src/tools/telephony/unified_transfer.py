@@ -18,6 +18,7 @@ from .deferred_transfer import (
     store_pending_deferred_transfer,
     transfer_deferral_enabled,
 )
+from ...core.operator_zero_state import OperatorZeroTransferState
 
 logger = structlog.get_logger(__name__)
 
@@ -329,7 +330,7 @@ class UnifiedTransferTool(Tool):
 
         try:
             session = await context.get_session()
-            session.current_action = {
+            predial_action = {
                 "type": "predial_transfer",
                 "deferred_action_id": action.get("id"),
                 "destination_key": destination_key,
@@ -351,6 +352,11 @@ class UnifiedTransferTool(Tool):
                     operator_zero_metadata.get("recipient") or ""
                 ).strip(),
             }
+            session.current_action = (
+                OperatorZeroTransferState.start(predial_action).action
+                if operator_zero_metadata
+                else predial_action
+            )
             await context.session_store.upsert_call(session)
         except Exception:
             logger.debug("Failed to persist predial transfer action state", call_id=context.call_id, exc_info=True)

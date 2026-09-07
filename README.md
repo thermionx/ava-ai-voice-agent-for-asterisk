@@ -37,6 +37,7 @@ The most powerful, flexible open-source AI voice agent for Asterisk/FreePBX. Fea
 - [🩺 Agent CLI Tools](#-agent-cli-tools)
 - [⚙️ Configuration](#-configuration)
 - [🏗️ Project Architecture](#-project-architecture)
+- [Operator Zero architecture and customizations](#operator-zero)
 - [📊 Requirements](#-requirements)
 - [🗺️ Documentation](#-documentation)
 - [🤝 Contributing](#-contributing)
@@ -1211,7 +1212,7 @@ AVA Operator helps MSPs and operators manage AI voice across multiple Asterisk a
 ## Operator Zero
 
 This fork of AVA is also used as the real-time voice-agent engine for
-[Operator Zero](https://github.com/thermionx/OperatorZero), an AI-powered
+[Operator Zero](https://github.com/thermionx/operator-zero), an AI-powered
 household telephone operator.
 
 Operator Zero builds on AVA with household call screening, private caller
@@ -1222,10 +1223,303 @@ household telephones.
 Operator Zero is the application; AVA provides the underlying real-time
 voice-agent engine and Asterisk integration.
 
+### How the components fit together
+
+Operator Zero spans two repositories: this customized AVA fork contains the
+voice engine and call-control integrations; the companion Operator Zero
+repository contains household services, Asterisk routing, agent templates, and
+deployment instructions. It is not a single additional process sitting on top
+of AVA.
+
+```mermaid
+flowchart LR
+    T[Twilio / public telephone network] <--> A[Asterisk]
+    P[House phones] <--> H[Grandstream analog adapter]
+    H <--> A
+    A <-->|ARI control and AudioSocket audio| V[Customized AVA]
+    V <-->|Conversation audio and tool requests| O[OpenAI Realtime]
+    A --> M[Household memory service]
+    V --> M
+    V --> W[Web / search service]
+    U[AVA Admin UI] --> C[Agent settings and configuration]
+    C --> V
+```
+
+| Component | Responsibility in the reference household installation |
+|---|---|
+| **Twilio** | Connects the household telephone number to the public telephone network for incoming and outgoing calls. |
+| **Grandstream adapter** | Connects analog house phones to Asterisk through SIP and provides their analog telephone interface. |
+| **Asterisk** | Runs extensions, ringing, answering, outbound dialing, audio bridges, keypad handling, voicemail recording/retrieval, and hangup. Its dialplan selects the route for each call. |
+| **AVA `ai_engine`** | Selects the agent, establishes the AI session, converts and moves audio, executes tools, coordinates transfers, and manages call state and cleanup. |
+| **OpenAI Realtime** | Understands speech, generates spoken responses, and requests tools. AVA executes those requests; the model does not directly operate Asterisk or the household services. |
+| **Household memory service** | Persists caller identities, trusted/blocked status, caller history, and household context independently of individual AI conversations. |
+| **Web/search service** | Performs information lookups, including search and directions, and returns results for the agent to explain. |
+| **AVA Admin UI** | Manages agents, tools, and operational settings. It does not carry the conversation audio. |
+
+Docker and systemd keep the services running on the MiniPC. AVA also supports an
+optional `local_ai_server` for local speech/model components and configured
+fallbacks; it is distinct from the OpenAI Realtime conversation provider.
+
+### Who controls a call?
+
+Asterisk and AVA exchange both **control** and **audio**, through different
+interfaces. **ARI/Stasis** lets Asterisk hand a call to AVA's application and
+lets AVA request telephone operations, such as originating a second call leg,
+playing an announcement, joining a bridge, or hanging up. **AudioSocket** carries
+conversation audio between them in the Operator Zero reference installation.
+AVA then exchanges audio and events with OpenAI Realtime.
+
+The Asterisk **dialplan** is the telephone routing program. Operator Zero's
+routes send household extension `0` to the internal agent, send unknown outside
+callers to the screening agent, dial outside numbers through Twilio, and provide
+voicemail and voicemail retrieval. For trusted-caller bypass, Asterisk queries
+the memory service before deciding whether to ring the household directly.
+That route does not require an AI screening conversation.
+
+For a screened incoming call, AVA gathers identity and recipient information,
+prepares the transfer, and rings a separate household call leg. It plays the
+private announcement to that leg while keeping the outside caller separate,
+then asks Asterisk to connect them. On an unanswered household call, AVA can
+return the outside caller to Asterisk's voicemail dialplan. Asterisk owns the
+actual voicemail application and recording.
+
+For incoming Operator Zero calls, requesting private-announcement playback is
+also the cutoff for voicemail or a return to the AI conversation. If the
+household hangs up during that announcement, playback fails, or the subsequent
+connection fails, AVA ends the outside call without granting trust. Calls that
+are never answered can still go to voicemail.
+
+In the current Operator Zero **predial** flow, automatic trust requires completed
+private announcement playback and successful bridging. This treats connection
+after the announcement as acceptance; it does **not** establish that the household
+gave an explicit spoken "yes." Merely ringing or entering voicemail does not
+satisfy this predial trust condition. AVA's separate attended-transfer flow can
+collect a keypad acceptance decision; it should not be confused with this flow.
+
+### Internal call sequence: dialing the operator
+
+This is a household member dialing `0`, not directly dialing an outside number.
+The phone and analog adapter are grouped into one participant for readability.
+Audio arrows summarize streams rather than individual packets; call-control
+requests and tool requests are shown separately.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor H as House phone via adapter
+    participant A as Asterisk
+    participant V as AVA engine
+    participant O as OpenAI Realtime
+    participant S as Memory or search service
+    participant T as Twilio
+
+    H->>A: Dial 0
+    A->>V: Enter Stasis with internal agent selected
+    V->>V: Load agent settings and create call session
+    V->>A: Answer and establish AudioSocket media
+    V->>O: Open conversation with agent instructions and tools
+    O-->>V: Greeting audio
+    V-->>A: Greeting over AudioSocket
+    A-->>H: Play greeting
+
+    loop Conversation while AI owns the call
+        H->>A: Caller speech
+        A->>V: AudioSocket input audio
+        V->>O: Caller audio
+        opt Agent requests caller information or a web lookup
+            O->>V: Tool request
+            V->>S: Execute configured HTTP lookup
+            S-->>V: Result or error
+            V-->>O: Tool result
+        end
+        O-->>V: Spoken response audio
+        V-->>A: AudioSocket output audio
+        A-->>H: Play response
+    end
+
+    alt User requests an outbound call
+        O->>V: dial_phone tool request
+        V->>V: Validate target and resolve profile contact if applicable
+        Note over V,O: Unknown numbers require staging and confirmation.<br/>Verified trusted/profile numbers can bypass readback.
+        opt Confirmation required
+            V-->>O: Request digit readback and confirmation
+            O-->>V: Confirmation question audio
+            V-->>A: Question audio
+            A-->>H: Read back number
+            H->>A: Confirm number
+            A->>V: Caller audio
+            V->>O: Caller audio
+            O->>V: dial_phone with same target and confirmed=true
+            V->>V: Arm handoff; wait for caller-facing speech to drain
+            Note over V: A newer caller turn cancels a stale pending handoff.
+        end
+        V->>A: Continue in outbound dialplan if action remains valid
+        A->>T: Dial outside number
+        T-->>A: Answer, busy, or no answer
+        A-->>H: Connect outside audio or end failed attempt
+    else User requests voicemail retrieval
+        O->>V: check_voicemail tool request
+        V->>V: Validate and defer handoff until playback completes
+        V->>A: Continue in voicemail retrieval dialplan
+        A-->>H: VoiceMailMain prompts and messages
+        H->>A: Keypad commands
+    else User finishes the AI conversation
+        H->>A: Hang up, or ask the agent to end the call
+        A->>V: Hangup event, or caller audio leading to hangup tool
+        V->>A: Release AI-owned call resources as needed
+    end
+    Note over A,V: AVA closes its AI session and media on handoff or termination.<br/>After a successful dialplan handoff, Asterisk owns the remaining phone call.
+```
+
+### External call sequence: incoming household call
+
+The trusted bypass is an Asterisk routing decision. The screened path below is
+Operator Zero's predial/private-announcement flow, not AVA's separate keypad
+acceptance flow. Tool errors and unsupported targets prevent the transfer from
+being armed; the diagram expands the answered and unanswered paths after a
+valid transfer request.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Outside caller
+    participant T as Twilio
+    participant A as Asterisk
+    participant M as Household memory
+    participant V as AVA engine
+    participant O as OpenAI Realtime
+    actor H as House phone via adapter
+
+    C->>T: Call household number
+    T->>A: Incoming SIP call
+    A->>M: Record caller seen and look up trust
+    M-->>A: Caller identity and trust status
+
+    alt Caller is trusted
+        A-->>H: Ring household directly
+        alt Household answers
+            H->>A: Answer
+            Note over C,H: Asterisk connects the household to the caller through Twilio.<br/>No AVA screening conversation is needed.
+        else Household does not answer
+            A-->>T: Asterisk voicemail greeting
+            T-->>C: Play voicemail greeting
+            C->>T: Leave message
+            T->>A: Message audio for Asterisk to record
+        end
+    else Caller has no trusted bypass
+        A->>V: Enter Stasis with incoming screening agent
+        V->>V: Load agent and create call session
+        V->>A: Answer and establish AudioSocket media
+        V->>O: Open screening conversation
+        loop Collect caller identity and intended recipient
+            O-->>V: Screening question audio
+            V-->>A: AudioSocket output audio
+            A-->>T: Question audio
+            T-->>C: Play question
+            C->>T: Caller response
+            T->>A: Caller audio
+            A->>V: AudioSocket input audio
+            V->>O: Caller audio
+        end
+        O->>V: Request household transfer with screening information
+        V->>V: Validate and arm transfer
+        Note over V,O: Caller-facing transfer speech must finish before bridging.
+        V->>A: Originate separate household leg
+        A-->>H: Ring household
+        Note over C,H: Outside caller remains separate from household audio.
+
+        alt Household answers
+            H->>A: Answer
+            A->>V: Destination answered event
+            V->>V: Claim announcement ownership and prepare private audio
+            V->>A: Play private announcement to household leg only
+            A-->>H: Announce caller and recipient
+            alt Announcement completes and bridge succeeds
+                A-->>V: Playback completion
+                V->>A: Remove AI media and join caller with household
+                A-->>V: Bridge operation succeeds
+                V->>M: Record accepted caller / grant trust
+                M-->>V: Stored result
+                Note over C,H: Two-way conversation now runs through Asterisk and Twilio.<br/>No separate spoken acceptance is required by this predial flow.
+            else Announcement or bridge fails
+                V->>A: Hang up outside caller and clean up owned legs
+                Note over V,M: No trust, return to agent, or voicemail after playback starts.
+            end
+        else Household does not answer before timeout
+            V->>A: Stop ringback and clean up unanswered leg
+            V->>A: Continue outside caller into voicemail dialplan
+            A-->>T: Asterisk voicemail greeting
+            T-->>C: Play voicemail greeting
+            C->>T: Leave message
+            T->>A: Message audio for Asterisk to record
+            Note over V,M: Voicemail handoff does not grant trust.
+        end
+    end
+    Note over A,V: Hangup can occur at any stage.<br/>Asterisk ends telephone legs; AVA cleans up resources it still owns.
+```
+
+### Agents, configuration, and persistent data
+
+The internal operator and incoming screener are configured agents using the same
+engine, not separate voice-engine programs. Each agent combines a prompt,
+greeting, provider/voice settings, and enabled tools and permissions. Live agent
+definitions are stored in AVA's `agents.db`; checked-in templates are starting
+points rather than the live database. See [Agents](docs/AGENTS.md).
+
+Caller trust and history live in the separate household memory service. A prompt
+is not that database, and starting a new AI conversation does not erase it.
+Asterisk voicemail storage, AVA call records, and private deployment settings
+are also distinct from agent prompts and source code.
+
+Changing a greeting, household profile, enabled tool, or default area code is
+generally a configuration/data change. Changing when two callers are connected,
+what makes a transfer successful, or how overlapping playback and hangup events
+are handled requires executable code. Prompts guide conversation; call-control
+code must enforce the telephone lifecycle.
+
+### Why this fork changes AVA code
+
+AVA supplies the general voice-agent platform. Operator Zero extends it for the
+household workflow:
+
+| Customization | Why it needs code beyond configuration |
+|---|---|
+| **Caller identity and private announcements** | Carry caller/recipient information through screening, synthesize the private announcement, and deliver it to the household leg before joining the outside caller. |
+| **Transfer state and concurrent events** | Distinguish announcement ownership from successful playback and prevent overlapping finalization events from bridging prematurely. |
+| **Predial trust updates** | Update household memory after announcement completion and successful connection, rather than after ringing or a voicemail handoff. |
+| **Deferred actions** | Let caller-facing speech finish before a handoff, and cancel a pending handoff when a newer caller turn makes it stale. |
+| **Outbound dialing and voicemail retrieval** | Validate targets, implement confirmation handling, resolve household profile contacts, expand local numbers using a configured area code, and enter the appropriate Asterisk route. |
+| **Greeting and tool-response handling** | Preserve caller audio near greeting boundaries, support configurable greeting interruption, and return useful tool failures to the conversation. |
+| **Failure handling and cleanup** | Handle unsupported transfers, failed announcements, unanswered calls, rejected handoffs, and hangups without treating an incomplete action as a successful transfer. |
+| **Shared media directory** | Make generated audio available at a path the host Asterisk process can read. This is deployment support in addition to the Python changes. |
+
+The main implementation areas are:
+
+- [`src/engine.py`](src/engine.py): call lifecycle, screening identity,
+  announcement playback, transfer coordination, trust integration, and cleanup.
+- [`src/core/operator_zero_state.py`](src/core/operator_zero_state.py): explicit
+  state for the Operator Zero predial handoff.
+- [`src/tools/telephony/`](src/tools/telephony/): transfer, deferred-action,
+  outbound dialing, hangup, and voicemail tools.
+- [`src/providers/openai_realtime.py`](src/providers/openai_realtime.py):
+  provider-specific audio, greeting, and conversation events.
+- [`src/tools/adapters/openai.py`](src/tools/adapters/openai.py) and
+  [`src/tools/http/`](src/tools/http/): tool execution integration and HTTP lookups.
+
+These responsibilities are not yet fully separated: substantial Operator Zero
+coordination remains inside AVA's engine. The companion repository owns the
+household service implementations and dialplan, while this fork calls those
+services and coordinates their use during an AI-managed call.
+
+The [Operator Zero regression guide](docs/operator-zero-regression.md) documents
+the automated gate and its limits. Automated tests simulate call events and
+failures; real-phone checks are still needed for audible announcements,
+two-way audio, voicemail, carrier hangup, and hardware behavior.
+
 For the complete Operator Zero system and installation instructions, see:
 
-- [Operator Zero](https://github.com/thermionx/OperatorZero)
-- [Operator Zero Mini PC Installation Guide](https://github.com/thermionx/OperatorZero/blob/main/docs/mini-pc-install.md)
+- [Operator Zero](https://github.com/thermionx/operator-zero)
+- [Operator Zero Mini PC Installation Guide](https://github.com/thermionx/operator-zero/blob/main/docs/mini-pc-install.md)
 
 ---
 

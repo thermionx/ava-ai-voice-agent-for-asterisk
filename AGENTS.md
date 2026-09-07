@@ -26,3 +26,15 @@ Report a finding only when it is introduced or exposed by the PR, has a concrete
 5. Triage final reviews together. If fixes are required, make one cohesive batch and rerun the final gate before merge.
 
 See [the pull-request workflow](docs/contributing/PULL_REQUEST_WORKFLOW.md) for commands, CI behavior, and merge requirements.
+
+## Regression-safety rules
+
+Future Codex changes must inspect the relevant existing behavior and its callers before editing production code. Make the smallest reasonable change, preserve unrelated behavior, and avoid unrelated refactoring, formatting, cleanup, restructuring, or dependency upgrades.
+
+Bug fixes must include regression coverage when reasonably reproducible. Every production bug that escapes testing should, where reasonably reproducible, result in a regression test so that the same bug cannot silently return.
+
+Treat existing tests as behavioral contracts. Never delete, skip, weaken, or make an assertion permissive merely to make an implementation pass. When the specification intentionally changes, identify that change explicitly and update or add focused contract coverage.
+
+Run `./test-operator-zero` after every meaningful production change and before declaring work complete. A change is complete only when its requested behavior works and previously passing regression tests remain passing. Clearly report all failures, distinguishing pre-existing baseline failures from regressions introduced by the change.
+
+At handoff, report every changed file and why it changed, all tests run and their results, any behavior that still requires hardware or manual validation, and any intentional specification change. Do not conceal partial validation.

@@ -2,12 +2,14 @@ import asyncio
 import sys
 import time
 import types
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.config import AppConfig
 from src.core.models import CallSession
 from src.engine import Engine
+from src.core.operator_zero_state import OperatorZeroTransferState
 
 
 def _build_engine(attended_transfer_cfg: dict) -> Engine:
@@ -762,6 +764,90 @@ async def test_predial_transfer_finalize_is_serialized():
 
 
 @pytest.mark.asyncio
+async def test_operator_zero_announcement_claim_cannot_bridge_before_playback():
+    engine = _build_engine({"enabled": True, "predial_bridge_wait_timeout_sec": 2})
+    call_id = "call-operator-zero-announcement-race"
+    destination_channel = "SIP/100-00000001"
+    session = CallSession(
+        call_id=call_id,
+        caller_channel_id="caller-operator-zero-race",
+        bridge_id="bridge-operator-zero-race",
+        caller_name="Bob",
+    )
+    state = OperatorZeroTransferState.start(
+        {
+            "type": "predial_transfer",
+            "target": "100",
+            "target_name": "Inside phone",
+            "predial_channel_id": destination_channel,
+        }
+    ).destination_answered(destination_channel)
+    session.current_action = state.action
+    await engine.session_store.upsert_call(session)
+
+    tts_started = asyncio.Event()
+    release_tts = asyncio.Event()
+    tts_calls = []
+    add_calls = []
+
+    async def fake_extract_name(_session):
+        return "Bob"
+
+    async def fake_extract_business(_session):
+        return ""
+
+    async def fake_tts(*, call_id, text, timeout_sec):
+        tts_calls.append(text)
+        tts_started.set()
+        await release_tts.wait()
+        return b"\xff" * 160
+
+    async def fake_play(**kwargs):
+        return "announcement-complete"
+
+    async def fake_add(bridge_id, channel_id):
+        add_calls.append((bridge_id, channel_id))
+        return True
+
+    engine._operator_zero_extract_spoken_caller_name = fake_extract_name
+    engine._operator_zero_extract_spoken_business_name = fake_extract_business
+    engine._local_ai_server_tts = fake_tts
+    engine._play_ulaw_bytes_on_channel_and_wait = fake_play
+    engine.ari_client.add_channel_to_bridge = fake_add
+    engine.ari_client.remove_channel_from_bridge = AsyncMock(return_value=True)
+    engine.ari_client.send_command = AsyncMock(return_value={"status": 204})
+
+    context = types.SimpleNamespace(
+        call_id=call_id,
+        caller_channel_id=session.caller_channel_id,
+    )
+    action = {
+        "description": "Inside phone",
+        "target": "100",
+        "transfer_type": "extension",
+    }
+
+    first = asyncio.create_task(engine.finalize_predial_transfer(context, action))
+    await asyncio.wait_for(tts_started.wait(), timeout=1)
+    second = asyncio.create_task(engine.finalize_predial_transfer(context, action))
+    await asyncio.sleep(0.1)
+
+    assert tts_calls == ["Bob is on the line."]
+    assert add_calls == []
+
+    release_tts.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result["status"] == "success"
+    assert second_result["status"] == "success"
+    assert add_calls == [("bridge-operator-zero-race", destination_channel)]
+
+    updated = await engine.session_store.get_by_call_id(call_id)
+    state = OperatorZeroTransferState.load(updated.current_action)
+    assert state.phase.value == "bridged"
+    assert state.trust_eligible is True
+
+
+@pytest.mark.asyncio
 async def test_predial_transfer_finalize_in_progress_does_not_report_success(monkeypatch):
     engine = _build_engine({"enabled": True})
     session = CallSession(
@@ -1043,3 +1129,61 @@ async def test_attended_transfer_caller_recording_mode_streams_intro_clip_and_pr
     assert tts_texts[0] == "Hi, this is Ava. Here is the caller's screening."
     assert tts_texts[1] == "Press 1 to accept this transfer, or 2 to decline."
     assert stream_lengths == [320, 1600, 320]
+
+
+@pytest.mark.asyncio
+async def test_operator_zero_inside_hangup_after_private_playback_ends_outside_call():
+    engine = _build_engine({"enabled": True})
+    session = CallSession(call_id="cutoff-hangup", caller_channel_id="outside-cutoff", context_name="operator_zero_incoming")
+    session.current_action = OperatorZeroTransferState.start({"type": "predial_transfer", "predial_channel_id": "inside-cutoff"}).announcement_started().action
+    session.current_action["private_announcement_playback_started"] = True
+    session.transfer_active = True
+    session.pending_deferred_transfer = {"id": "pending"}
+    await engine.session_store.upsert_call(session)
+    engine.ari_client.hangup_channel = AsyncMock(return_value=True)
+    engine.ari_client.continue_in_dialplan = AsyncMock()
+    engine._cleanup_call = AsyncMock()
+    engine._operator_zero_mark_caller_trusted = AsyncMock()
+
+    await engine._handle_unbridged_predial_transfer_channel_end(session, "inside-cutoff")
+
+    engine.ari_client.hangup_channel.assert_awaited_once_with("outside-cutoff")
+    engine._cleanup_call.assert_awaited_once_with("cutoff-hangup", force_caller_hangup=True)
+    engine.ari_client.continue_in_dialplan.assert_not_awaited()
+    engine._operator_zero_mark_caller_trusted.assert_not_awaited()
+    assert session.pending_deferred_transfer is None
+    assert session.transfer_active is False
+    assert OperatorZeroTransferState.load(session.current_action).trust_eligible is False
+    assert session.current_action["operator_zero_terminal"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("playback_result", [None, "completed-after-hangup", "bridge-failed"])
+async def test_operator_zero_private_playback_failure_never_returns_to_voicemail(playback_result):
+    engine = _build_engine({"enabled": True, "predial_bridge_wait_timeout_sec": 1})
+    session = CallSession(call_id="cutoff-" + str(playback_result), caller_channel_id="outside-failure", context_name="operator_zero_incoming", caller_name="Bob")
+    session.current_action = OperatorZeroTransferState.start({"type": "predial_transfer", "predial_channel_id": "inside-failure", "target": "100"}).destination_answered("inside-failure").action
+    await engine.session_store.upsert_call(session)
+    engine._operator_zero_extract_spoken_caller_name = AsyncMock(return_value="Bob")
+    engine._operator_zero_extract_spoken_business_name = AsyncMock(return_value="")
+    engine._local_ai_server_tts = AsyncMock(return_value=b"\xff" * 160)
+    engine.ari_client.hangup_channel = AsyncMock(return_value=True)
+    engine.ari_client.continue_in_dialplan = AsyncMock()
+    engine._cleanup_call = AsyncMock()
+    engine._finalize_predial_transfer_bridge = AsyncMock(return_value=False)
+    engine._operator_zero_mark_caller_trusted = AsyncMock()
+
+    async def play(**kwargs):
+        assert session.current_action["private_announcement_playback_started"] is True
+        if playback_result == "completed-after-hangup":
+            await engine._handle_unbridged_predial_transfer_channel_end(session, "inside-failure")
+        return playback_result
+    engine._play_ulaw_bytes_on_channel_and_wait = play
+    result = await engine.finalize_predial_transfer(types.SimpleNamespace(call_id=session.call_id, caller_channel_id=session.caller_channel_id), {"target": "100"})
+    assert result["status"] == "failed"
+    engine.ari_client.hangup_channel.assert_awaited_with("outside-failure")
+    engine.ari_client.continue_in_dialplan.assert_not_awaited()
+    engine._operator_zero_mark_caller_trusted.assert_not_awaited()
+    if playback_result != "bridge-failed":
+        engine._finalize_predial_transfer_bridge.assert_not_awaited()
+    assert OperatorZeroTransferState.load(session.current_action).trust_eligible is False
