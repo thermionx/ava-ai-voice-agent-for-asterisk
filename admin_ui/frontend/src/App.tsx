@@ -17,6 +17,7 @@ import LoginPage from './pages/LoginPage';
 import ProvidersPage from './pages/ProvidersPage';
 import PipelinesPage from './pages/PipelinesPage';
 import AgentsPage from './pages/AgentsPage';
+import TrustedCallersPage from './pages/TrustedCallersPage';
 import MigrationStatusPage from './pages/MigrationStatusPage';
 import LegacyContextsRedirect from './pages/LegacyContextsRedirect';
 import ProfilesPage from './pages/ProfilesPage';
@@ -161,6 +162,7 @@ function App() {
                                             <Route path="/providers" element={<ProvidersPage />} />
                                             <Route path="/pipelines" element={<PipelinesPage />} />
                                             <Route path="/agents" element={<AgentsPage />} />
+                                            <Route path="/trusted-callers" element={<TrustedCallersPage />} />
                                             <Route path="/agents/migration" element={<MigrationStatusPage />} />
                                             <Route path="/contexts" element={<LegacyContextsRedirect />} />
                                             <Route path="/profiles" element={<ProfilesPage />} />

@@ -1562,3 +1562,10 @@ If you find this project useful, please also give it a ⭐️!
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left&sealed_token=OFUaTIQ_cHQIeI9JOUvCGWT1NhM4MLx-xr5TRZEdODgPVlh-fSiAKxhs6Oa328sldbZyjiYVOHXlxkkn02lMmVdoYXZdQRMWI72Dzjddo9VI67yQaZHOqg" />
  </picture>
 </a>
+
+### Trusted callers and Grandstream phonebook
+
+The **Trusted Callers** sidebar page manages the household approval list backed
+by Operator Zero memory, including contacts that have not called yet. Its DP755
+setup panel connects DP725 handsets to the same list through a read-only XML
+phonebook. See the [server and phone setup guide](https://github.com/thermionx/operator-zero/blob/main/docs/trusted-callers.md).

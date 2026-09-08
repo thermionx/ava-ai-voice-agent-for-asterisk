@@ -35,6 +35,7 @@ type PageEntry = {
 
 const pages: PageEntry[] = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard, group: 'Overview' },
+    { label: 'Trusted Callers', path: '/trusted-callers', icon: Phone, group: 'Overview', keywords: ['whitelist', 'phonebook', 'contacts'] },
     { label: 'Call History', path: '/history', icon: Phone, group: 'Overview', keywords: ['calls', 'phone'] },
     { label: 'Call Scheduling', path: '/scheduling', icon: CalendarClock, group: 'Overview', keywords: ['schedule', 'calendar'] },
     { label: 'Setup Wizard', path: '/wizard', icon: Zap, group: 'Overview', keywords: ['setup', 'onboard'] },
