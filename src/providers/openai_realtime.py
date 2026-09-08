@@ -1111,6 +1111,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             self._input_resample_state = None
             self._output_resample_state = None
             self._assistant_transcript_buffers.clear()
+            # Audit snapshots are already queued; release only the local copy.
+            self._audit_transcript_observer = None
             logger.info("OpenAI Realtime session stopped")
             self._clear_metrics(previous_call_id)
 
@@ -1873,6 +1875,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.debug("Failed to schedule OpenAI reconnect", call_id=self._call_id, exc_info=True)
 
     async def _handle_event(self, event: Dict[str, Any]):
+        from ..core.call_audit.realtime import observe as observe_audit_transcript
+        observe_audit_transcript(self, event)
         event_type = event.get("type")
         if event_type in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
             item_id = event.get("item_id")

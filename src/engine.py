@@ -82,6 +82,8 @@ from .core.transport_orchestrator import TransportOrchestrator, TransportProfile
 from .core.models import CallSession
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
 from .core.operator_zero_state import OperatorZeroTransferState
+from .core.call_audit.publisher import AuditPublisher, publish as publish_audit
+from .core.call_audit.ari import ARI_EVENTS as AUDIT_ARI_EVENTS
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
@@ -781,6 +783,11 @@ class Engine:
         self._live_status_task: Optional[asyncio.Task] = None
 
         # Event handlers
+        self.call_audit = AuditPublisher.from_env()
+        self.ari_client.call_audit = self.call_audit
+        if self.call_audit is not None:
+            for event_type in AUDIT_ARI_EVENTS:
+                self.ari_client.on_event(event_type, self.call_audit.observe_ari)
         self.ari_client.on_event("StasisStart", self._handle_stasis_start)
         self.ari_client.on_event("StasisEnd", self._handle_stasis_end)
         self.ari_client.on_event("ChannelDestroyed", self._handle_channel_destroyed)
@@ -1511,6 +1518,8 @@ class Engine:
         if not session or bool(getattr(session, "cleanup_in_progress", False)):
             return
         if clear_tts_gating_after_drain:
+            if drained:
+                publish_audit(self, call_id, "operator_zero_greeting_finished", evidence="caller_transport_drained")
             await self._clear_tts_gating_after_provider_drain(
                 call_id,
                 deferred_tts_tokens,
@@ -3904,6 +3913,12 @@ class Engine:
         except Exception:
             logger.debug("MCP manager stop error", exc_info=True)
         logger.info("Engine stopped.")
+        audit_publisher = getattr(self, "call_audit", None)
+        if audit_publisher is not None:
+            try:
+                await asyncio.to_thread(audit_publisher.close)
+            except Exception:
+                logger.warning("Audit publisher shutdown failed; telephone shutdown completed")
 
     def _set_provider_identity(self, provider: AIProviderInterface, provider_key: str, provider_kind: str) -> None:
         try:
@@ -5921,6 +5936,7 @@ class Engine:
                     vad_mode=getattr(self, "_vad_mode", "auto"),
                 )
             await self._save_session(session, new=True)
+            publish_audit(self, caller_channel_id, "operator_zero_session_started")
 
             # Read called_number: cache (from ChannelVarSet events) > GET request > "unknown"
             # The cache is populated from DIALED_NUMBER and __FROM_DID ChannelVarSet events
@@ -7550,6 +7566,8 @@ class Engine:
                 action["bridged"] = True
                 action["predial_channel_id"] = predial_channel_id
                 action["channel_id"] = predial_channel_id
+                publish_audit(self, call_id, "transfer_completed", destination="inside_phone", channel_id=predial_channel_id)
+                publish_audit(self, call_id, "channel_linked", channel_id=predial_channel_id, role="inside_phone")
                 session.current_action = action
                 session.transfer_state = "bridged"
                 session.transfer_destination = str(action.get("target_name") or action.get("target") or "")
@@ -10131,6 +10149,7 @@ class Engine:
                 audiosocket_channel_id = response["id"]
                 self.pending_audiosocket_channels[audiosocket_channel_id] = caller_channel_id
                 self.uuidext_to_channel[audio_uuid] = caller_channel_id
+                publish_audit(self, caller_channel_id, "channel_linked", channel_id=audiosocket_channel_id, role="audiosocket", audiosocket_uuid=audio_uuid)
 
                 session = await self.session_store.get_by_call_id(caller_channel_id)
                 if session:
@@ -10281,7 +10300,7 @@ class Engine:
             # but may not be available via GET when StasisStart fires (timing race)
             # Priority: DIALED_NUMBER > __FROM_DID (only cache if not already set)
             if channel_id and value:
-                if variable == "DIALED_NUMBER":
+                if variable in {"DIALED_NUMBER", "OZ_AUDIT_CALLED_NUMBER", "__OZ_AUDIT_CALLED_NUMBER"}:
                     self._called_number_cache[channel_id] = value
                     logger.debug(
                         "Cached called_number from DIALED_NUMBER",
@@ -14302,6 +14321,8 @@ class Engine:
             # A speech-start event is useful to the inactivity watchdog even when
             # there is no active agent response to cancel.
             if etype in ("ProviderBargeIn", "interruption", "UserStartedSpeaking", "CallerSpeechStarted"):
+                if etype in ("UserStartedSpeaking", "CallerSpeechStarted"):
+                    publish_audit(self, call_id, "caller_speech_started", evidence="provider_vad")
                 await self._no_input_note_activity(call_id, f"provider:{etype}")
                 if etype in ("UserStartedSpeaking", "CallerSpeechStarted"):
                     return
@@ -15867,6 +15888,7 @@ class Engine:
                 audio_drained=drained,
                 transport=getattr(getattr(self, "config", None), "audio_transport", None),
             )
+            publish_audit(self, call_id, "hangup_requested", reason=reason, audio_drained=drained)
             if getattr(session, "external_platform", None) == "vicidial":
                 finalized = False
                 try:
@@ -21215,6 +21237,7 @@ class Engine:
         Every step is best-effort: the core requirement is ending the dead air by
         hanging up, so a missing/unplayable prompt must never prevent the hangup.
         """
+        publish_audit(self, call_id, "call_failed", reason="provider_start_failed")
         prompt = (getattr(self.config, "provider_failure_prompt", "") or "").strip()
         if prompt:
             try:

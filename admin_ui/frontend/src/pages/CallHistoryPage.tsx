@@ -7,6 +7,7 @@ import {
     Play, Pause, Volume2, FileAudio, Search, ShieldCheck, SlidersHorizontal
 } from 'lucide-react';
 import axios from 'axios';
+import InboundCallHistory from '../components/calls/InboundCallHistory';
 import { toast } from 'sonner';
 import { FullscreenPanel } from '../components/ui/FullscreenPanel';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
@@ -188,7 +189,7 @@ const RoutingBadge = ({ method }: { method: string | null }) => {
     );
 };
 
-const CallHistoryPage = () => {
+const AISessionHistoryPage = () => {
     const { confirm } = useConfirmDialog();
     const location = useLocation();
     const navigate = useNavigate();
@@ -1216,7 +1217,7 @@ const CallHistoryPage = () => {
                                         </div>
                                         <div className="flex items-center gap-1 mt-1">
                                             <FileAudio className="w-3 h-3 text-muted-foreground shrink-0" />
-                                            <span className="text-xs text-muted-foreground truncate" title={recordingInfo.file_path || ''}>
+                                            <span className="text-xs text-muted-foreground truncate" title={recordingInfo.filename || ''}>
                                                 {recordingInfo.filename}
                                             </span>
                                             <span className="text-xs text-muted-foreground whitespace-nowrap">
@@ -1492,6 +1493,30 @@ const CallHistoryPage = () => {
             )}
         </div>
     );
+};
+
+const CallHistoryPage = () => {
+    const location = useLocation();
+    const navigate = useNavigate();
+    const [legacyEntry] = useState(() => new URLSearchParams(location.search).has('id'));
+    const [auditAvailable, setAuditAvailable] = useState(false);
+    useEffect(() => {
+        const controller = new AbortController();
+        axios.get('/api/call-audit/status', { signal: controller.signal })
+            .then(response => { if (!controller.signal.aborted) setAuditAvailable(Boolean(response.data.enabled || response.data.available)); })
+            .catch(() => { /* Existing history remains usable if audit is unavailable. */ });
+        return () => controller.abort();
+    }, []);
+    const params = new URLSearchParams(location.search);
+    const view = params.get('view');
+    const inbound = Boolean(params.get('call_id')) || view === 'inbound' || (!legacyEntry && !params.has('id') && view !== 'sessions' && auditAvailable);
+    return <div className="space-y-5">
+        <nav aria-label="History views" className="flex gap-2">
+            <button aria-pressed={inbound} className={`rounded-md border border-border px-4 py-2 ${inbound ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`} onClick={() => navigate('/history?view=inbound')}>Inbound calls</button>
+            <button aria-pressed={!inbound} className={`rounded-md border border-border px-4 py-2 ${!inbound ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`} onClick={() => navigate('/history?view=sessions')}>AI sessions</button>
+        </nav>
+        {inbound ? <InboundCallHistory /> : <AISessionHistoryPage />}
+    </div>;
 };
 
 export default CallHistoryPage;

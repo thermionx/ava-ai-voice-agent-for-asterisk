@@ -1,0 +1,84 @@
+# Opt-in Operator Zero inbound audit. Use with the normal compose files.
+# Install private directories/ACLs with Operator Zero's install-call-audit script.
+services:
+  admin_ui:
+    group_add:
+      - ${ASTERISK_GID:-995}
+    volumes:
+      - ${CALL_RECORDING_HOST_DIR:-/var/spool/asterisk/monitor/operator-zero}:/mnt/operator-zero-recordings:ro
+  call_audit:
+    image: asterisk-ai-voice-agent-ai-engine:latest
+    pull_policy: never
+    user: "${CALL_AUDIT_UID:-1000}:${CALL_AUDIT_GID:-1000}"
+    group_add:
+      - ${ASTERISK_GID:-995}
+    working_dir: /app
+    command: ["python", "-m", "src.core.call_audit.worker"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      CALL_AUDIT_DB_PATH: /app/data/call_audit.db
+      CALL_AUDIT_JOURNAL_DIR: /app/data/call-audit-journal
+      CALL_AUDIT_CEL_PATH: /mnt/asterisk_cel/operator-zero.jsonl
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ${CALL_AUDIT_CEL_HOST_DIR:-/var/log/asterisk/cel-custom}:/mnt/asterisk_cel:ro
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+  call_audit_media:
+    image: asterisk-ai-voice-agent-ai-engine:latest
+    pull_policy: never
+    user: "${CALL_AUDIT_UID:-1000}:${CALL_AUDIT_GID:-1000}"
+    group_add:
+      - ${ASTERISK_GID:-995}
+    working_dir: /app
+    command: ["python", "-m", "src.core.call_audit.media"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      CALL_AUDIT_ENABLED: ${CALL_AUDIT_ENABLED:-false}
+      CALL_RECORDING_ENABLED: ${CALL_RECORDING_ENABLED:-false}
+      CALL_TRANSCRIPTION_ENABLED: ${CALL_TRANSCRIPTION_ENABLED:-false}
+      CALL_TRANSCRIPTION_PROVIDER: ${CALL_TRANSCRIPTION_PROVIDER:-openai}
+      CALL_AUDIT_DB_PATH: /app/data/call_audit.db
+      CALL_RECORDING_DIR: /mnt/operator-zero-recordings
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ${CALL_RECORDING_HOST_DIR:-/var/spool/asterisk/monitor/operator-zero}:/mnt/operator-zero-recordings:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+  call_audit_retention:
+    image: asterisk-ai-voice-agent-ai-engine:latest
+    pull_policy: never
+    profiles: [maintenance]
+    user: "${CALL_AUDIT_UID:-1000}:${CALL_AUDIT_GID:-1000}"
+    group_add:
+      - ${ASTERISK_GID:-995}
+    working_dir: /app
+    command: ["python", "-m", "src.core.call_audit.retention"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      CALL_AUDIT_DB_PATH: /app/data/call_audit.db
+      CALL_AUDIT_JOURNAL_DIR: /app/data/call-audit-journal
+      CALL_AUDIT_CEL_PATH: /mnt/asterisk_cel/operator-zero.jsonl
+      CALL_RECORDING_DIR: /mnt/operator-zero-recordings
+      CALL_RECORDING_RETENTION_DAYS: ${CALL_RECORDING_RETENTION_DAYS:-30}
+      CALL_METADATA_RETENTION_DAYS: ${CALL_METADATA_RETENTION_DAYS:-365}
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ${CALL_RECORDING_HOST_DIR:-/var/spool/asterisk/monitor/operator-zero}:/mnt/operator-zero-recordings
+      - ${CALL_AUDIT_CEL_HOST_DIR:-/var/log/asterisk/cel-custom}:/mnt/asterisk_cel
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]

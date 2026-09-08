@@ -35,6 +35,8 @@ if project_root not in sys.path:
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+from . import call_audit
+router.include_router(call_audit.router)
 
 
 def _get_server_timezone():
@@ -897,7 +899,7 @@ async def get_call_recording_info(record_id: str):
     return RecordingInfoResponse(
         has_recording=True,
         filename=recording.name,
-        file_path=str(recording),
+        file_path=None,  # Preserve the response shape without exposing host paths.
         file_size_bytes=size,
         duration_hint="empty" if size <= _MIN_VALID_WAV_SIZE else None,
     )

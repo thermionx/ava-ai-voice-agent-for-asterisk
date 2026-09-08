@@ -25,6 +25,8 @@ from websockets.asyncio.client import ClientConnection
 
 from .config import AsteriskConfig
 from .logging_config import get_logger
+from .core.call_audit.publisher import publish as publish_audit
+from .core.call_audit.events import timestamp as audit_timestamp
 
 logger = get_logger(__name__)
 
@@ -557,10 +559,20 @@ class ARIClient:
     async def hangup_channel(self, channel_id: str) -> bool:
         """Hang up a channel and report whether ARI accepted the request."""
         logger.info("Hanging up channel", channel_id=channel_id)
+        audit_requested_at = audit_timestamp()
+        publish_audit(self, channel_id, "hangup_requested", reason="ari_delete")
         # A 404 here is the normal post-StasisEnd race: caller disconnected first,
         # Asterisk destroyed the channel, and our cleanup hangup arrives a beat later.
         # Not a failure — log neutrally so it doesn't read as an error in RCAs.
         response = await self.send_command("DELETE", f"channels/{channel_id}", tolerate_statuses=[404])
+        # Preserve the existing idempotent 404 return contract, but do not
+        # attribute an already-disconnected caller to an engine hangup.
+        audit_status = response.get("status") if isinstance(response, dict) else None
+        publish_audit(
+            self, channel_id,
+            "hangup_accepted" if isinstance(audit_status, int) and 200 <= audit_status < 300 else "hangup_failed",
+            requested_at=audit_requested_at, http_status=audit_status,
+        )
         if response and response.get("status") == 404:
             logger.debug(
                 "Hangup no-op: channel already destroyed (expected post-StasisEnd race)",

@@ -320,6 +320,11 @@ data/**/*.db-journal
 data/**/*.db-wal
 data/**/*.db-shm
 data/operator/.migration.lock
+data/call-audit-journal/
+recordings/
+data/call-recordings/
+data/call_audit.db*
+data/**/*.sqlite3*
 !data/.gitkeep
 
 # Custom (community) model entries — user-specific, persists across upgrades
