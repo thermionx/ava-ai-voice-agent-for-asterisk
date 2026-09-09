@@ -29,7 +29,26 @@ describe('Trusted callers', () => {
         fireEvent.change(screen.getByLabelText('Phone number'), {target:{value:'2025550101'}});
         fireEvent.change(screen.getByLabelText('Name'), {target:{value:'Bob'}});
         fireEvent.click(screen.getByText('Save trusted caller'));
-        await waitFor(() => expect(axios.post).toHaveBeenCalledWith('/api/trusted-callers', {caller_number:'2025550101', caller_name:'Bob',business_name:''}));
+        await waitFor(() => expect(axios.post).toHaveBeenCalledWith('/api/trusted-callers', {caller_number:'2025550101', caller_name:'Bob',business_name:'',create_only:true}));
+    });
+    it('keeps the add form open and explains duplicate numbers', async () => {
+        vi.mocked(axios.isAxiosError).mockReturnValue(true);
+        vi.mocked(axios.post).mockRejectedValueOnce({response: {data: {detail: 'This phone number is already in use. Edit the existing caller instead.'}}});
+        render(<TrustedCallersPage />);
+        await screen.findByText('Alice');
+        fireEvent.click(screen.getByText('Add caller'));
+        fireEvent.change(screen.getByLabelText('Phone number'), {target:{value:'+12025550100'}});
+        fireEvent.click(screen.getByText('Save trusted caller'));
+        await waitFor(() => expect(mocks.error).toHaveBeenCalledWith('This phone number is already in use. Edit the existing caller instead.'));
+        expect(screen.getByLabelText('Phone number')).toHaveValue('+12025550100');
+        expect(screen.getByText('Alice')).toBeInTheDocument();
+    });
+    it('explicitly allows editing the existing caller', async () => {
+        render(<TrustedCallersPage />);
+        fireEvent.click(await screen.findByLabelText('Edit Alice'));
+        fireEvent.change(screen.getByLabelText('Name'), {target:{value:'Alicia'}});
+        fireEvent.click(screen.getByText('Save trusted caller'));
+        await waitFor(() => expect(axios.post).toHaveBeenCalledWith('/api/trusted-callers', {caller_number:'2025550100', caller_name:'Alicia',business_name:'Workshop',create_only:false}));
     });
     it('only revokes trust after confirmation', async () => {
         mocks.confirm.mockResolvedValueOnce(false).mockResolvedValueOnce(true);

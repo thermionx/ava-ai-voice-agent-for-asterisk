@@ -11,6 +11,7 @@ router = APIRouter(prefix="/trusted-callers", dependencies=[Depends(get_current_
 
 
 class TrustedCaller(BaseModel):
+    create_only: bool = True
     caller_number: str = Field(min_length=7, max_length=40)
     caller_name: str = Field(default="", max_length=120)
     business_name: str = Field(default="", max_length=120)

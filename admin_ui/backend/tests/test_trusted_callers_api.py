@@ -63,3 +63,19 @@ def test_missing_integration_and_explicit_password_reveal(client, monkeypatch):
     monkeypatch.delenv('OPERATOR_ZERO_PHONEBOOK_PASSWORD')
     assert client.get('/api/trusted-callers/phonebook').json()['enabled'] is False
     assert client.get('/api/trusted-callers/phonebook/password').status_code == 503
+
+
+def test_duplicate_add_is_forwarded_without_overwriting(client, monkeypatch):
+    import json
+    requests = []
+    async def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(400, json={'error': 'This phone number is already in use. Edit the existing caller instead.'})
+    original = httpx.AsyncClient
+    monkeypatch.setattr(api.httpx, 'AsyncClient', lambda **kw: original(transport=httpx.MockTransport(handle), **kw))
+    response = client.post('/api/trusted-callers', json={'caller_number': '2025550100'})
+    assert response.status_code == 400
+    assert 'already in use' in response.json()['detail']
+    assert requests[-1]['create_only'] is True
+    client.post('/api/trusted-callers', json={'caller_number': '2025550100', 'create_only': False})
+    assert requests[-1]['create_only'] is False

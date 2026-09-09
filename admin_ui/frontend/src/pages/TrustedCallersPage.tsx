@@ -59,7 +59,7 @@ export default function TrustedCallersPage() {
         event.preventDefault();
         setSaving(true);
         try {
-            await axios.post('/api/trusted-callers', form);
+            await axios.post('/api/trusted-callers', { ...form, create_only: !existing });
             setEditing(false);
             toast.success('Caller saved. Future calls will ring the inside phone directly.');
             await refresh();
