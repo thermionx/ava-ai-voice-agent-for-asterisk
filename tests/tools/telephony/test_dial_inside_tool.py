@@ -45,7 +45,7 @@ async def test_analog_retry_reuses_handler_and_cancel_clears_target(tool_context
     mock_ari_client.set_channel_var.return_value = True
     mock_ari_client.send_command = AsyncMock(return_value={'value': '1'})
     tool = DialInsideTool()
-    await tool.execute({'target': '101'}, tool_context)
+    await tool.execute({'target': 'all'}, tool_context)
     assert all(c.args[1] != 'CHANNEL(hangup_handler_push)' for c in mock_ari_client.set_channel_var.await_args_list)
     result = await tool.execute({'target': 'cancel'}, tool_context)
     assert result['status'] == 'success'
@@ -80,3 +80,72 @@ async def test_missing_dialplan_does_not_arm_callback(tool_context, mock_ari_cli
     result = await DialInsideTool().execute({'target':'all'}, tool_context)
     assert result['status'] == 'error'
     mock_ari_client.set_channel_var.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source,target', [('102','103'),('102','100'),('102','101'),('103','102'),('103','100'),('103','101')])
+async def test_analog_to_other_line_stays_connected(tool_context, mock_ari_client, sample_call_session, source, target):
+    tool_context.context_name = 'operator_zero'
+    tool_context.caller_number = source
+    mock_ari_client.set_channel_var.return_value = True
+    tool = DialInsideTool()
+    result = await tool.execute({'target':target}, tool_context)
+    assert 'stay on the line' in result['message']
+    assert not result.get('waiting_for_hangup')
+    assert all(c.args[1] != 'CHANNEL(hangup_handler_push)' for c in mock_ari_client.set_channel_var.await_args_list)
+    mock_ari_client.set_channel_var.assert_awaited_with(tool_context.caller_channel_id, 'OZ_LOCAL_RING_TARGET', '')
+    mock_ari_client.continue_in_dialplan.assert_not_awaited()
+    result = await tool.commit_deferred_action(sample_call_session.pending_deferred_transfer, tool_context)
+    assert result['status'] == 'success'
+    mock_ari_client.continue_in_dialplan.assert_awaited_once_with(tool_context.caller_channel_id, context='operator-zero-local-call', extension=target, priority=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['102','103'])
+async def test_same_analog_port_requires_hangup(tool_context, mock_ari_client, source):
+    tool_context.context_name = 'operator_zero'
+    tool_context.caller_number = source
+    mock_ari_client.set_channel_var.return_value = True
+    result = await DialInsideTool().execute({'target':source}, tool_context)
+    assert result['waiting_for_hangup']
+    mock_ari_client.continue_in_dialplan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_switch_between_ringback_and_direct_call(tool_context, mock_ari_client, sample_call_session):
+    tool_context.context_name = 'operator_zero'
+    tool_context.caller_number = '102'
+    variables = {}
+    async def set_var(channel, variable, value):
+        variables[variable] = value
+        return True
+    mock_ari_client.set_channel_var.side_effect = set_var
+    tool = DialInsideTool()
+    await tool.execute({'target':'all'}, tool_context)
+    assert variables['OZ_LOCAL_RING_TARGET'] == 'all'
+    await tool.execute({'target':'101'}, tool_context)
+    assert variables['OZ_LOCAL_RING_TARGET'] == ''
+    assert sample_call_session.pending_deferred_transfer['target'] == '101'
+    await tool.execute({'target':'102'}, tool_context)
+    assert sample_call_session.pending_deferred_transfer is None
+    assert variables['OZ_LOCAL_RING_TARGET'] == '102'
+
+
+@pytest.mark.asyncio
+async def test_direct_call_is_not_armed_if_old_ringback_cannot_clear(tool_context, mock_ari_client, sample_call_session):
+    tool_context.context_name = 'operator_zero'
+    tool_context.caller_number = '102'
+    mock_ari_client.set_channel_var.return_value = False
+    result = await DialInsideTool().execute({'target':'101'}, tool_context)
+    assert result['status'] == 'error'
+    assert sample_call_session.pending_deferred_transfer is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target', ['all','102'])
+async def test_commit_cannot_bypass_analog_hangup_rule(tool_context, mock_ari_client, target):
+    tool_context.context_name = 'operator_zero'
+    tool_context.caller_number = '102'
+    result = await DialInsideTool().commit_deferred_action({'target':target}, tool_context)
+    assert result['status'] == 'error'
+    mock_ari_client.continue_in_dialplan.assert_not_awaited()

@@ -17,8 +17,9 @@ class DialInsideTool(Tool):
             name="dial_inside", category=ToolCategory.TELEPHONY, requires_channel=True,
             description=("Call house phones locally. Use all for 'dial inside line' or 'ring the house phones'; "
                          "100 for HS1, 101 for HS2, 102 for Analog Port 1, 103 for Analog Port 2. "
-                         "Invoke BEFORE speaking. Speak the returned instructions exactly. Analog callers must "
-                         "hang up first; SIP callers stay connected. Use cancel to cancel a pending analog ring request. "
+                         "Invoke BEFORE speaking. Speak the returned instructions exactly. Analog callers hang up only "
+                         "when calling all phones or their own analog port. Calls to a different line stay connected. "
+                         "SIP callers stay connected. Use cancel to cancel a pending analog ring request. "
                          "Never use dial_phone or the outside house telephone number for this request."),
             parameters=[ToolParameter(name="target", type="string", required=True,
                                       enum=[*TARGETS, "cancel"], description="Local line or all house phones.")],
@@ -42,7 +43,13 @@ class DialInsideTool(Tool):
             return {"status": "success", "message": "The inside ringing request is cancelled."}
         if await ari.dialplan_target_exists(channel, context=CONTEXT, extension=target, priority=1) is not True:
             return {"status": "error", "message": "Inside calling is not installed in Asterisk."}
-        if source in {"102", "103"}:
+        if source in {"102", "103"} and target in {"all", source}:
+            # Switching from a direct call to ringback cancels the earlier handoff.
+            session = await context.get_session()
+            pending = getattr(session, "pending_deferred_transfer", None)
+            if isinstance(pending, dict) and pending.get("source_tool") == "dial_inside":
+                session.pending_deferred_transfer = None
+                await context.session_store.upsert_call(session)
             # Install once; retries replace the target rather than stacking callbacks.
             # Target is written last so a partial setup cannot start a ringback.
             response = await ari.send_command("GET", f"channels/{channel}/variable", params={"variable": "OZ_LOCAL_RING_HANDLER"})
@@ -65,6 +72,10 @@ class DialInsideTool(Tool):
             ), "waiting_for_hangup": True}
         if target == source:
             return {"status": "error", "message": f"You are already using {LINES[source]}. Please choose another line."}
+        if source in {"102", "103"}:
+            # A previous all/same-port request must not fire when this call ends.
+            if await ari.set_channel_var(channel, "OZ_LOCAL_RING_TARGET", "") is not True:
+                return {"status": "error", "message": "Unable to cancel the previous inside ringing request."}
         action = build_deferred_transfer_action(
             source_tool="dial_inside", commit_tool="dial_inside", transfer_type="inside_call",
             target=target, description=TARGETS[target], dialplan_context=CONTEXT,
@@ -75,7 +86,8 @@ class DialInsideTool(Tool):
     async def commit_deferred_action(self, action, context):
         target = str(action.get("target") or "")
         source = str(context.caller_number or "")
-        if context.context_name != "operator_zero" or source not in {"100", "101"} or target not in TARGETS or source == target:
+        if (context.context_name != "operator_zero" or source not in LINES or target not in TARGETS or source == target
+                or (source in {"102", "103"} and target == "all")):
             return {"status": "error", "message": "Invalid inside call target."}
         if await context.ari_client.set_channel_var(context.caller_channel_id, "OZ_LOCAL_EXCLUDE", source) is not True:
             return {"status": "error", "message": "Unable to prepare inside calling."}
