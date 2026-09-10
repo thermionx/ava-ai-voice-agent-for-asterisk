@@ -29,6 +29,9 @@ async def test_analog_arms_hangup_without_dial_or_forced_hangup(tool_context, mo
     result = await DialInsideTool().execute({'target': 'all'}, tool_context)
     assert result['waiting_for_hangup'] is True
     assert 'hang up' in result['message']
+    assert 'stay connected' in result['message']
+    assert 'ten seconds' in result['message']
+    assert 'reach Operator Zero' not in result['message']
     mock_ari_client.set_channel_var.assert_any_await(tool_context.caller_channel_id, 'CHANNEL(hangup_handler_push)', 'operator-zero-local-ringback,s,1')
     mock_ari_client.set_channel_var.assert_awaited_with(tool_context.caller_channel_id, 'OZ_LOCAL_RING_TARGET', 'all')
     mock_ari_client.continue_in_dialplan.assert_not_awaited()

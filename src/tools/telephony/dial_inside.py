@@ -61,7 +61,7 @@ class DialInsideTool(Tool):
                     return {"status": "error", "message": "Unable to prepare inside ringing."}
             return {"status": "success", "message": (
                 f"Please hang up now. Once you hang up, I will ring {TARGETS[target]}. "
-                "Whoever answers will reach Operator Zero."
+                "The answering phones will stay connected. Allow about ten seconds for others to pick up."
             ), "waiting_for_hangup": True}
         if target == source:
             return {"status": "error", "message": f"You are already using {LINES[source]}. Please choose another line."}
