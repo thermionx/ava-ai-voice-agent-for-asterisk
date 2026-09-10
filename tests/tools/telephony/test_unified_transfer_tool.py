@@ -45,6 +45,29 @@ class TestUnifiedTransferTool:
             {"caller_name": "Bob", "recipient": "Lilian"}, history
         ) is None
 
+    @pytest.mark.parametrize("surname", ["McGlothlen", "McGlothlin", "McGlothlan", "McLaughlin", "McLoughlin", "McLaughlan", "MacLachlan", "McLachlan", "McGloughlin", "MacGlothlen", "Mc Glothlen"])
+    def test_operator_zero_accepts_household_surname_variants(self, tool, surname):
+        history = [{"role": "user", "content": f"I am William {surname}, calling for Brian {surname}."}]
+        assert tool._validate_operator_zero_screening(
+            {"caller_name": "William McGlothlen", "recipient": "Brian McGlothlen"}, history
+        ) is None
+        assert tool._validate_operator_zero_screening(
+            {"caller_name": f"William {surname}", "recipient": f"Brian {surname}"},
+            [{"role": "user", "content": "William McGlothlen calling for Brian McGlothlen"}],
+        ) is None
+
+    def test_surname_aliases_do_not_invent_first_names_or_use_assistant_evidence(self, tool):
+        for history in [
+            [{"role": "user", "content": "Bob McLaughlin calling for Brian"}],
+            [{"role": "assistant", "content": "William McLaughlin calling for Brian"}],
+            [{"role": "user", "content": "William Smith calling for Brian"}],
+        ]:
+            assert tool._validate_operator_zero_screening(
+                {"caller_name": "William McGlothlen", "recipient": "Brian"}, history
+            ) == "The caller's identity was not confirmed in the conversation."
+        assert not tool._screening_value_was_spoken("McGlothlen hospital", [
+            {"role": "user", "content": "McLaughlin hospital"}])
+
     def test_operator_zero_rejects_generic_household_recipient(self, tool):
         history = [
             {"role": "user", "content": "I'm Bob. I need the head of household."},

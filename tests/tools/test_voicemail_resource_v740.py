@@ -57,3 +57,22 @@ async def test_execute_fails_closed_when_voicemail_is_globally_disabled():
     }
     context.update_session.assert_not_awaited()
     context.ari_client.send_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_household_voicemail_does_not_require_screening(monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    context = SimpleNamespace(
+        call_id="unknown-caller", caller_channel_id="outside-channel",
+        get_config_value=MagicMock(return_value={"enabled": True, "extension": "100"}),
+        update_session=AsyncMock(),
+        ari_client=SimpleNamespace(send_command=AsyncMock()),
+    )
+    result = await VoicemailTool().execute({}, context)
+    assert result["status"] == "success"
+    context.ari_client.send_command.assert_awaited_once_with(
+        method="POST", resource="channels/outside-channel/continue",
+        params={"context": "ext-local", "extension": "vmu100", "priority": 1},
+    )
+    context.update_session.assert_awaited_once_with(
+        transfer_active=True, transfer_target="Voicemail 100")

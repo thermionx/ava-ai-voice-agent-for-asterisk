@@ -104,9 +104,17 @@ class UnifiedTransferTool(Tool):
         return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
 
     @classmethod
-    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]]) -> bool:
+    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]], *, name_aliases: bool = False) -> bool:
         def evidence_text(raw: Any) -> str:
-            return " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
+            text = " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
+            if name_aliases:
+                # Household-authorized surname variants only; never fuzzy-match
+                # first names, organizations, or official/emergency reasons.
+                text = re.sub(
+                    r"\b(?:mc|mac)\s*(?:glothl[aei]n|gl[ao]ughlin|l[ao]ughl[ai]n|lachlan)\b",
+                    "mcglothlen", text,
+                )
+            return text
 
         needle = evidence_text(value)
         if not needle:
@@ -130,7 +138,7 @@ class UnifiedTransferTool(Tool):
         company = metadata.get("company", "")
         reason = metadata.get("reason", "")
 
-        if caller_name and not cls._screening_value_was_spoken(caller_name, history):
+        if caller_name and not cls._screening_value_was_spoken(caller_name, history, name_aliases=True):
             return "The caller's identity was not confirmed in the conversation."
 
         generic_recipients = {
@@ -143,7 +151,7 @@ class UnifiedTransferTool(Tool):
         if named_recipient:
             if not caller_name:
                 return "The caller must identify themselves before a household transfer."
-            if not cls._screening_value_was_spoken(recipient, history):
+            if not cls._screening_value_was_spoken(recipient, history, name_aliases=True):
                 return "The named recipient was not stated by the caller."
             return None
 
@@ -635,7 +643,8 @@ class UnifiedTransferTool(Tool):
                     reason=screening_error,
                     metadata=screening_metadata,
                 )
-                return {"status": "failed", "message": screening_error}
+                return {"status": "failed", "message": screening_error,
+                        "next_action": "Offer voicemail. If the caller accepts, invoke leave_voicemail. Do not repeat the unchanged transfer."}
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}
