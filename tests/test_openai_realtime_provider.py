@@ -623,7 +623,7 @@ async def test_error_tool_output_waits_for_parent_response_done(openai_config):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("context_name,tool_name", [("operator_zero_incoming", "blind_transfer"), ("operator_zero", "dial_phone")])
+@pytest.mark.parametrize("context_name,tool_name", [("operator_zero_incoming", "blind_transfer"), ("operator_zero", "dial_phone"), ("operator_zero", "dial_inside")])
 async def test_operator_zero_transfer_waits_for_transcript_before_validation_and_arming(openai_config, monkeypatch, context_name, tool_name):
     from src.tools.telephony.unified_transfer import UnifiedTransferTool
     from src.tools.telephony import deferred_transfer
@@ -727,3 +727,19 @@ async def test_deferred_call_result_corrects_provider_only_on_failure(openai_con
         assert event["type"] == "conversation.item.create"
         assert event["item"]["role"] == "system"
         assert "NOT placed" in event["item"]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_other_analog_routing_clears_ringback_before_execution(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._context_name = 'operator_zero'
+    provider._caller_number = '102'
+    provider._caller_channel_id = 'analog-channel'
+    provider._ari_client = SimpleNamespace(set_channel_var=AsyncMock(return_value=True))
+    provider._await_operator_zero_input_transcripts = AsyncMock()
+    async def execute(event, context):
+        provider._ari_client.set_channel_var.assert_awaited_once_with('analog-channel', 'OZ_LOCAL_RING_TARGET', '')
+        return {'status': 'success'}
+    provider.tool_adapter = SimpleNamespace(handle_tool_call_event=AsyncMock(side_effect=execute), send_tool_result=AsyncMock())
+    await provider._handle_function_call({'item': {'name': 'dial_phone', 'call_id': 'dial-test', 'arguments': '{}'}})
+    provider.tool_adapter.handle_tool_call_event.assert_awaited_once()

@@ -612,6 +612,12 @@ Tool Definitions:
             logger.warning(f"Could not import CheckVoicemailTool: {e}")
 
         try:
+            from src.tools.telephony.dial_inside import DialInsideTool
+            self.register(DialInsideTool)
+        except ImportError as e:
+            logger.warning(f"Could not import local calling tool: {e}")
+
+        try:
             from src.tools.telephony.dial_phone import DialPhoneTool, ListDialedNumbersTool
             self.register(DialPhoneTool)
             self.register(ListDialedNumbersTool)

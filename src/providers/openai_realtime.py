@@ -835,7 +835,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     "Telephony status update: the pending call was NOT placed. "
                     "The announcement was not a completed call. "
                     "Do not claim that it went through or was already placed. "
-                    "If the caller still wants the call, invoke dial_phone again; "
+                    "If the caller still wants the call, invoke the appropriate calling tool again; "
                     "otherwise follow their latest request."
                 )}],
             },
@@ -887,9 +887,18 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 (getattr(self, "_context_name", None) == "operator_zero_incoming"
                  and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer")
                 or (getattr(self, "_context_name", None) == "operator_zero"
-                    and function_name == "dial_phone")
+                    and function_name in {"dial_phone", "dial_inside"})
             ):
                 await self._await_operator_zero_input_transcripts()
+            # A different routing request supersedes an analog ring-on-hangup request.
+            if (getattr(self, "_context_name", None) == "operator_zero"
+                    and getattr(self, "_caller_number", None) in {"102", "103"}
+                    and function_name in {"dial_phone", "check_voicemail", "blind_transfer"}):
+                cleared = await self._ari_client.set_channel_var(
+                    self._caller_channel_id, "OZ_LOCAL_RING_TARGET", ""
+                )
+                if cleared is not True:
+                    raise RuntimeError("Unable to cancel the previous inside ringing request.")
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)
 
             # Check if this is a hangup_call tool that will trigger hangup
