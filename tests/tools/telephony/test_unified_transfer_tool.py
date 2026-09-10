@@ -49,11 +49,12 @@ class TestUnifiedTransferTool:
     def test_operator_zero_accepts_household_surname_variants(self, tool, surname):
         history = [{"role": "user", "content": f"I am William {surname}, calling for Brian {surname}."}]
         assert tool._validate_operator_zero_screening(
-            {"caller_name": "William McGlothlen", "recipient": "Brian McGlothlen"}, history
+            {"caller_name": "William McGlothlen", "recipient": "Brian McGlothlen"}, history, name_aliases={"McGlothlen": [surname]}
         ) is None
         assert tool._validate_operator_zero_screening(
             {"caller_name": f"William {surname}", "recipient": f"Brian {surname}"},
             [{"role": "user", "content": "William McGlothlen calling for Brian McGlothlen"}],
+            name_aliases={"McGlothlen": [surname]},
         ) is None
 
     def test_surname_aliases_do_not_invent_first_names_or_use_assistant_evidence(self, tool):
@@ -63,10 +64,26 @@ class TestUnifiedTransferTool:
             [{"role": "user", "content": "William Smith calling for Brian"}],
         ]:
             assert tool._validate_operator_zero_screening(
-                {"caller_name": "William McGlothlen", "recipient": "Brian"}, history
+                {"caller_name": "William McGlothlen", "recipient": "Brian"}, history, name_aliases={"McGlothlen": ["McLaughlin"]}
             ) == "The caller's identity was not confirmed in the conversation."
         assert not tool._screening_value_was_spoken("McGlothlen hospital", [
             {"role": "user", "content": "McLaughlin hospital"}])
+
+    def test_name_aliases_are_configured_and_match_whole_words(self, tool):
+        history = [{"role": "user", "content": "Sam Smyth calling for Pat"}]
+        metadata = {"caller_name": "Sam Smith", "recipient": "Pat"}
+        assert tool._validate_operator_zero_screening(metadata, history) is not None
+        assert tool._validate_operator_zero_screening(metadata, history, {"Smith": ["Smyth"]}) is None
+        assert not tool._screening_value_was_spoken("Sam Smith", [
+            {"role": "user", "content": "Sam Smythson"}
+        ], name_aliases={"Smith": ["Smyth"]})
+
+    @pytest.mark.parametrize("aliases", [True, [], {"Smith": "Smyth"}, {"Smith": [None]},
+        {"Smith": ["Smyth"], "Jones": ["Smyth"]}, {"": ["Smyth"]}])
+    def test_invalid_name_aliases_keep_exact_matching(self, tool, aliases):
+        history = [{"role": "user", "content": "Sam Smyth"}]
+        assert not tool._screening_value_was_spoken("Sam Smith", history, name_aliases=aliases)
+        assert tool._screening_value_was_spoken("Sam Smyth", history, name_aliases=aliases)
 
     def test_operator_zero_rejects_generic_household_recipient(self, tool):
         history = [
@@ -94,6 +111,23 @@ class TestUnifiedTransferTool:
             },
             history,
         ) is None
+
+    @pytest.mark.asyncio
+    async def test_execute_reads_name_aliases_from_runtime_config(self, tool, tool_context):
+        tool_context.context_name = "operator_zero_incoming"
+        tool_context.get_session = AsyncMock(return_value=Mock(conversation_history=[
+            {"role": "user", "content": "Sam Smyth calling for Pat"}
+        ]))
+        tool_context.config["tools"]["transfer"]["destinations"] = {
+            "inside_phone": {"type": "extension", "target": "100"}
+        }
+        arguments = {"destination": "inside_phone", "caller_name": "Sam Smith", "recipient": "Pat"}
+        result = await tool.execute(arguments, tool_context)
+        assert result["status"] == "failed"
+        assert "identity" in result["message"]
+        tool_context.config["tools"]["transfer"]["screening_name_aliases"] = {"Smith": ["Smyth"]}
+        result = await tool.execute(arguments, tool_context)
+        assert result["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_resolves_destination_by_description_match(self, tool, tool_context, mock_ari_client):

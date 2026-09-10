@@ -104,17 +104,41 @@ class UnifiedTransferTool(Tool):
         return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
 
     @classmethod
-    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]], *, name_aliases: bool = False) -> bool:
+    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]], *, name_aliases: Any = None) -> bool:
+        def normalize(raw: Any) -> str:
+            return " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
+
+        # Aliases are household configuration, never model/tool arguments.
+        # Invalid or ambiguous mappings fall back to exact transcript matching.
+        replacements = {}
+        valid = isinstance(name_aliases, dict)
+        if valid:
+            for canonical, variants in name_aliases.items():
+                if not isinstance(canonical, str) or not normalize(canonical) or not isinstance(variants, list):
+                    valid = False
+                    break
+                target = normalize(canonical)
+                for variant in [canonical, *variants]:
+                    if not isinstance(variant, str) or not normalize(variant):
+                        valid = False
+                        break
+                    alias = normalize(variant)
+                    if alias in replacements and replacements[alias] != target:
+                        valid = False
+                        break
+                    replacements[alias] = target
+                if not valid:
+                    break
+        pattern = None
+        if valid and replacements:
+            pattern = re.compile(r"\b(?:" + "|".join(
+                re.escape(alias) for alias in sorted(replacements, key=len, reverse=True)
+            ) + r")\b")
+
         def evidence_text(raw: Any) -> str:
-            text = " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
-            if name_aliases:
-                # Household-authorized surname variants only; never fuzzy-match
-                # first names, organizations, or official/emergency reasons.
-                text = re.sub(
-                    r"\b(?:mc|mac)\s*(?:glothl[aei]n|gl[ao]ughlin|l[ao]ughl[ai]n|lachlan)\b",
-                    "mcglothlen", text,
-                )
-            return text
+            text = normalize(raw)
+            # One pass prevents alias replacements from cascading.
+            return pattern.sub(lambda match: replacements[match.group(0)], text) if pattern else text
 
         needle = evidence_text(value)
         if not needle:
@@ -131,6 +155,7 @@ class UnifiedTransferTool(Tool):
         cls,
         metadata: Dict[str, str],
         history: List[Dict[str, Any]],
+        name_aliases: Any = None,
     ) -> Optional[str]:
         """Fail closed when the model invents incoming-call screening facts."""
         caller_name = metadata.get("caller_name", "")
@@ -138,7 +163,7 @@ class UnifiedTransferTool(Tool):
         company = metadata.get("company", "")
         reason = metadata.get("reason", "")
 
-        if caller_name and not cls._screening_value_was_spoken(caller_name, history, name_aliases=True):
+        if caller_name and not cls._screening_value_was_spoken(caller_name, history, name_aliases=name_aliases):
             return "The caller's identity was not confirmed in the conversation."
 
         generic_recipients = {
@@ -151,7 +176,7 @@ class UnifiedTransferTool(Tool):
         if named_recipient:
             if not caller_name:
                 return "The caller must identify themselves before a household transfer."
-            if not cls._screening_value_was_spoken(recipient, history, name_aliases=True):
+            if not cls._screening_value_was_spoken(recipient, history, name_aliases=name_aliases):
                 return "The named recipient was not stated by the caller."
             return None
 
@@ -635,6 +660,7 @@ class UnifiedTransferTool(Tool):
             screening_error = self._validate_operator_zero_screening(
                 screening_metadata,
                 list(getattr(session, "conversation_history", None) or []),
+                name_aliases=context.get_config_value("tools.transfer.screening_name_aliases"),
             )
             if screening_error:
                 logger.warning(
