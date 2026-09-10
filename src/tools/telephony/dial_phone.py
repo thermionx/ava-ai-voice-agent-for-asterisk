@@ -277,18 +277,33 @@ class DialPhoneTool(Tool):
                 "asks to call a household member's mobile or cell phone. "
                 "Seven-digit local numbers are expanded with the configured default "
                 "area code. If no default is configured, seven-digit numbers are rejected. "
-                "On the first invocation set confirmed=false; the tool returns the digits "
-                "that must be repeated to the user and asks whether they are correct. "
-                "Only after the user explicitly confirms those digits, invoke again "
-                "with the identical phone_number and confirmed=true. A number may come "
-                "from directory assistance, a trusted-caller lookup, caller-history "
-                "lookup, or the user's speech. Trusted callers are verified by the tool "
-                "and dialed immediately without number readback."
+                "Always invoke this tool BEFORE announcing that you are calling. "
+                "On the first invocation set confirmed=false. Follow the returned result: "
+                "if confirmation is required, ask its question and wait for the user to "
+                "confirm before invoking again with the same phone_number and confirmed=true. "
+                "Verified trusted and Agent-profile contacts do not require confirmation. "
+                "In household announcement mode, explicitly user-dictated numbers also "
+                "do not require another confirmation. A deferred success requires you to "
+                "speak the returned message; dialing follows its playback. "
+                "Never substitute a spoken promise for this function call."
             ),
             category=ToolCategory.TELEPHONY,
             requires_channel=True,
             max_execution_time=15,
             parameters=[
+                ToolParameter(
+                    name="number_source",
+                    type="string",
+                    description=(
+                        "Where the requested number came from: user if the household user "
+                        "dictated the digits, contact for a named saved contact, or directory "
+                        "for a number found by search. In configured household announcement "
+                        "mode, user-dictated numbers are read back and dialed without a "
+                        "second confirmation. Speak the returned message before handoff."
+                    ),
+                    required=False,
+                    enum=["user", "contact", "directory"],
+                ),
                 ToolParameter(
                     name="phone_number",
                     type="string",
@@ -318,6 +333,12 @@ class DialPhoneTool(Tool):
         parameters: Dict[str, Any],
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
+        cfg = context.get_config_value("tools.dial_phone", {}) or {}
+        announce = (
+            context.context_name == "operator_zero"
+            and cfg.get("household_dial_announcements") is True
+        )
+        dictated = announce and parameters.get("number_source") == "user"
         display_name = _clean_display_name(parameters.get("display_name"))
         number = normalize_nanp_number(
             parameters.get("phone_number"),
@@ -326,7 +347,7 @@ class DialPhoneTool(Tool):
         try:
             profile_number = await asyncio.to_thread(
                 _agent_profile_number_for_name,
-                display_name,
+                "" if dictated else display_name,
                 context.context_name,
             )
         except Exception:
@@ -354,6 +375,18 @@ class DialPhoneTool(Tool):
         history = list(getattr(session, "conversation_history", None) or [])
         pending = getattr(session, "pending_phone_call", None)
         confirmed = parameters.get("confirmed") is True
+        if dictated:
+            action = self._build_dial_action(number, number, context)
+            if not _SAFE_CONTEXT.fullmatch(str(action.get("dialplan_context") or "")):
+                return {"status": "failed", "message": "Outbound calling is not configured safely."}
+            session.pending_phone_call = None
+            await context.session_store.upsert_call(session)
+            await store_pending_deferred_transfer(context, action)
+            return build_deferred_transfer_result(
+                action=action,
+                message=f"Calling {spoken_digits(number)} now.",
+                extra={"phone_number": number, "approval_source": "user_dictated"},
+            )
 
         # Operator-managed sources, not the model, own the confirmation
         # exemption. Any lookup failure falls through to fail-closed readback.
@@ -400,6 +433,17 @@ class DialPhoneTool(Tool):
                     target_last4=number[-4:],
                     approval_source=approval_source,
                 )
+                if announce:
+                    await store_pending_deferred_transfer(context, action)
+                    return build_deferred_transfer_result(
+                        action=action,
+                        message=f"Calling {label} now.",
+                        extra={
+                            "phone_number": number,
+                            "trusted_number": True,
+                            "approval_source": approval_source,
+                        },
+                    )
                 result = await self.commit_deferred_action(action, context)
                 result.update(
                     {

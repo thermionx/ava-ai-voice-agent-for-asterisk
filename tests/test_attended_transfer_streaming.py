@@ -1187,3 +1187,25 @@ async def test_operator_zero_private_playback_failure_never_returns_to_voicemail
     if playback_result != "bridge-failed":
         engine._finalize_predial_transfer_bridge.assert_not_awaited()
     assert OperatorZeroTransferState.load(session.current_action).trust_eligible is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["cancelled", "error", "success"])
+async def test_deferred_call_failure_reaches_provider(monkeypatch, status):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    engine = _build_engine({"enabled": True})
+    session = CallSession(call_id="call-feedback", caller_channel_id="caller", context_name="operator_zero")
+    session.pending_deferred_transfer = {"kind": "transfer", "commit_tool": "dial_phone"}
+    await engine.session_store.upsert_call(session)
+    notify = AsyncMock()
+    engine._call_providers = {session.call_id: SimpleNamespace(notify_deferred_transfer_result=notify)}
+    monkeypatch.setattr(engine, "_wait_for_deferred_transfer_audio_drain", AsyncMock(return_value=True))
+    monkeypatch.setattr(engine, "_play_deferred_transfer_local_handoff", AsyncMock(return_value=False))
+    result = {"status": status}
+    monkeypatch.setattr("src.tools.telephony.deferred_transfer.commit_pending_deferred_transfer", AsyncMock(return_value=result))
+    await engine._commit_pending_deferred_transfer_for_call(session.call_id, session)
+    if status == "success":
+        notify.assert_not_awaited()
+    else:
+        notify.assert_awaited_once_with(result)

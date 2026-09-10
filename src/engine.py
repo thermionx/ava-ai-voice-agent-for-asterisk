@@ -21797,6 +21797,16 @@ class Engine:
                 message=result.get("message"),
             )
 
+            if result.get("status") in {"cancelled", "error", "failure"}:
+                provider = getattr(self, "_call_providers", {}).get(call_id)
+                notify = getattr(provider, "notify_deferred_transfer_result", None)
+                if notify and getattr(session, "context_name", None) == "operator_zero":
+                    try:
+                        await notify(result)
+                    except Exception:
+                        logger.warning("Could not deliver deferred call failure to provider",
+                                       call_id=call_id, exc_info=True)
+
             # Do not infer household acceptance from the generic tool result:
             # voicemail routing is also reported as a successful handoff. The
             # predial bridge owner marks trust only after announcement playback

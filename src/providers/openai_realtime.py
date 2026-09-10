@@ -822,6 +822,25 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if latest_item != self._latest_input_audio_item or self._closing or self._closed:
             raise RuntimeError("Caller turn changed or call ended before transfer validation.")
 
+    async def notify_deferred_transfer_result(self, result: Dict[str, Any]) -> None:
+        """Correct the conversation after an announced handoff did not occur."""
+        if result.get("status") not in {"cancelled", "error", "failure"}:
+            return
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": (
+                    "Telephony status update: the pending call was NOT placed. "
+                    "The announcement was not a completed call. "
+                    "Do not claim that it went through or was already placed. "
+                    "If the caller still wants the call, invoke dial_phone again; "
+                    "otherwise follow their latest request."
+                )}],
+            },
+        })
+
     async def _handle_function_call(self, event_data: Dict[str, Any]):
         """
         Handle function call request from OpenAI Realtime API.
@@ -865,8 +884,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # flight can close the continuous playback segment before the real
             # tool response arrives, leaving its audio queued with no consumer.
             if (
-                getattr(self, "_context_name", None) == "operator_zero_incoming"
-                and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer"
+                (getattr(self, "_context_name", None) == "operator_zero_incoming"
+                 and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer")
+                or (getattr(self, "_context_name", None) == "operator_zero"
+                    and function_name == "dial_phone")
             ):
                 await self._await_operator_zero_input_transcripts()
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)

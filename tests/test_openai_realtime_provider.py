@@ -623,7 +623,8 @@ async def test_error_tool_output_waits_for_parent_response_done(openai_config):
 
 
 @pytest.mark.asyncio
-async def test_operator_zero_transfer_waits_for_transcript_before_validation_and_arming(openai_config, monkeypatch):
+@pytest.mark.parametrize("context_name,tool_name", [("operator_zero_incoming", "blind_transfer"), ("operator_zero", "dial_phone")])
+async def test_operator_zero_transfer_waits_for_transcript_before_validation_and_arming(openai_config, monkeypatch, context_name, tool_name):
     from src.tools.telephony.unified_transfer import UnifiedTransferTool
     from src.tools.telephony import deferred_transfer
 
@@ -631,7 +632,7 @@ async def test_operator_zero_transfer_waits_for_transcript_before_validation_and
     store = SimpleNamespace(get_by_call_id=AsyncMock(return_value=session), upsert_call=AsyncMock())
     context = SimpleNamespace(call_id="transcript-race", get_session=AsyncMock(return_value=session), session_store=store)
     provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
-    provider._context_name = "operator_zero_incoming"
+    provider._context_name = context_name
     provider._track_conversation = AsyncMock()
 
     async def persist_transcript(text, **kwargs):
@@ -647,7 +648,7 @@ async def test_operator_zero_transfer_waits_for_transcript_before_validation_and
     adapter = SimpleNamespace(handle_tool_call_event=AsyncMock(side_effect=execute), send_tool_result=AsyncMock())
     provider.tool_adapter = adapter
     await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "request-brian"})
-    task = asyncio.create_task(provider._handle_function_call({"item": {"type": "function_call", "name": "blind_transfer", "call_id": "tool-1", "arguments": "{}"}}))
+    task = asyncio.create_task(provider._handle_function_call({"item": {"type": "function_call", "name": tool_name, "call_id": "tool-1", "arguments": "{}"}}))
     await asyncio.sleep(0)
     adapter.handle_tool_call_event.assert_not_awaited()
     await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "request-brian", "transcript": "I'm looking for Brian."})
@@ -711,3 +712,18 @@ async def test_operator_zero_transcript_waiter_cancels_without_executing_tool(op
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not provider._input_transcription_events["pending"].is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["cancelled", "error", "success"])
+async def test_deferred_call_result_corrects_provider_only_on_failure(openai_config, status):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._send_json = AsyncMock()
+    await provider.notify_deferred_transfer_result({"status": status})
+    if status == "success":
+        provider._send_json.assert_not_awaited()
+    else:
+        event = provider._send_json.call_args.args[0]
+        assert event["type"] == "conversation.item.create"
+        assert event["item"]["role"] == "system"
+        assert "NOT placed" in event["item"]["content"][0]["text"]

@@ -449,3 +449,59 @@ async def test_unsafe_context_fails_closed(tool, tool_context, sample_call_sessi
 
     assert result["status"] == "failed"
     assert sample_call_session.pending_deferred_transfer is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["trusted", "profile"])
+async def test_household_contact_announcement_precedes_dial(
+    tool, tool_context, sample_call_session, monkeypatch, source
+):
+    tool_context.context_name = "operator_zero"
+    tool_context.config["tools"]["dial_phone"] = {"household_dial_announcements": True}
+    monkeypatch.setattr(dial_phone_module, "_number_is_trusted", lambda n: source == "trusted")
+    monkeypatch.setattr(dial_phone_module, "_number_is_in_agent_profile", lambda n, c: source == "profile")
+    result = await tool.execute(
+        {"phone_number": "9255550123", "display_name": "Pat", "confirmed": False, "number_source": "contact"},
+        tool_context,
+    )
+    assert result["message"] == "Calling Pat now."
+    assert result[DEFERRED_TRANSFER_RESULT_KEY]["target"] == "9255550123"
+    assert sample_call_session.pending_deferred_transfer is not None
+    tool_context.ari_client.continue_in_dialplan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dictated_number_readback_arms_dial_without_confirmation(
+    tool, tool_context, sample_call_session, monkeypatch
+):
+    tool_context.context_name = "operator_zero"
+    tool_context.config["tools"]["dial_phone"] = {"household_dial_announcements": True}
+    monkeypatch.setattr(dial_phone_module, "_agent_profile_number_for_name", lambda name, ctx: "9255550999" if name else None)
+    result = await tool.execute(
+        {"phone_number": "(925) 555-0123", "display_name": "Pat", "confirmed": False, "number_source": "user"},
+        tool_context,
+    )
+    assert result["message"] == "Calling 9 2 5 5 5 5 0 1 2 3 now."
+    assert result[DEFERRED_TRANSFER_RESULT_KEY]["target"] == "9255550123"
+    assert sample_call_session.pending_phone_call is None
+    tool_context.ari_client.continue_in_dialplan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_name,enabled,source", [
+    ("operator_zero_incoming", True, "user"),
+    ("operator_zero", False, "user"),
+    ("operator_zero", "true", "user"),
+    ("operator_zero", True, "directory"),
+    ("operator_zero", True, None),
+])
+async def test_announcement_policy_keeps_other_confirmation_paths(
+    tool, tool_context, context_name, enabled, source
+):
+    tool_context.context_name = context_name
+    tool_context.config["tools"]["dial_phone"] = {"household_dial_announcements": enabled}
+    result = await tool.execute(
+        {"phone_number": "9255550123", "confirmed": False, "number_source": source}, tool_context
+    )
+    assert result["status"] == "confirmation_required"
+    tool_context.ari_client.continue_in_dialplan.assert_not_awaited()
