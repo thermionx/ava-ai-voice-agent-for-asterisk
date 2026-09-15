@@ -9212,7 +9212,7 @@ class Engine:
             return ""
 
         text = _re.sub(
-            r"^(?:uh|um|erm)[, ]+",
+            r"^(?:(?:uh|um|erm|well|yeah|yes|hi|hello)[, ]+)+",
             "",
             text,
             flags=_re.IGNORECASE,
@@ -9256,6 +9256,13 @@ class Engine:
                 word.casefold().strip(".,!?;:")
                 for word in raw_name.split()
             }
+
+            # Requests and call-purpose phrases after "I'm" are not names.
+            if raw_name.split()[0].casefold() in {
+                "looking", "calling", "trying", "hoping", "wanting", "asking",
+                "just", "here", "with", "from", "a", "an", "the",
+            }:
+                continue
 
             if words & relationship_words:
                 return ""
@@ -9357,120 +9364,17 @@ class Engine:
             # operator's name.
             import re as _re
 
-            explicit_patterns = [
-                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?this is\s+"
-                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
-                r"(?=[.!?,](?:\s|$)|$)",
-
-                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?my name is\s+"
-                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
-                r"(?=[.!?,](?:\s|$)|$)",
-
-                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i am\s+"
-                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
-                r"(?=[.!?,](?:\s|$)|$)",
-
-                r"^(?:yes[, ]+)?(?:hi[, ]+|hello[, ]+)?i['’]m\s+"
-                r"([A-Za-z][A-Za-z'’.-]*(?:\s+[A-Za-z][A-Za-z'’.-]*){0,3}?)"
-                r"(?=[.!?,](?:\s|$)|$)",
-            ]
-
-            # Prefer the earliest clear self-identification.
+            # Use the same conservative parser as live transcript learning.
             for message in recent_messages:
                 if not isinstance(message, dict):
                     continue
-
                 if str(message.get("role") or "").strip().lower() != "user":
                     continue
-
-                utterance = str(message.get("content") or "").strip()
-                if not utterance:
-                    continue
-
-                # Remove harmless speech fillers before matching.
-                cleaned = _re.sub(
-                    r"^(?:uh|um|erm)[, ]+",
-                    "",
-                    utterance,
-                    flags=_re.IGNORECASE,
-                ).strip()
-
-                for pattern in explicit_patterns:
-                    match = _re.match(
-                        pattern,
-                        cleaned,
-                        flags=_re.IGNORECASE,
-                    )
-
-                    if not match:
-                        continue
-
-                    raw_name = match.group(1).strip()
-
-                    # Remove sentence punctuation captured at the end of
-                    # an otherwise valid spoken name.
-                    raw_name = raw_name.rstrip(".,!?;:")
-
-                    # Do not mistake a relationship description for the
-                    # caller's actual name.  For example:
-                    #
-                    #   "I'm Brian's wife."
-                    #   "I'm his husband."
-                    #   "I'm Susan's friend."
-                    #
-                    # These may be useful screening context, but they are not
-                    # the caller's spoken name.
-                    relationship_words = {
-                        "wife",
-                        "husband",
-                        "spouse",
-                        "mother",
-                        "father",
-                        "mom",
-                        "mum",
-                        "dad",
-                        "daughter",
-                        "son",
-                        "sister",
-                        "brother",
-                        "aunt",
-                        "uncle",
-                        "cousin",
-                        "friend",
-                        "neighbor",
-                        "neighbour",
-                        "girlfriend",
-                        "boyfriend",
-                        "partner",
-                    }
-
-                    raw_words = {
-                        word.casefold().strip(".,!?;:")
-                        for word in raw_name.split()
-                    }
-
-                    if raw_words & relationship_words:
-                        logger.info(
-                            "Operator Zero rejected relationship as caller name",
-                            call_id=getattr(session, "call_id", None),
-                            candidate=raw_name,
-                            source_transcript=utterance,
-                        )
-                        continue
-
-                    name = " ".join(
-                        part.capitalize()
-                        for part in raw_name.split()
-                    ).strip()
-
-                    if name:
-                        logger.info(
-                            "Operator Zero learned explicit caller spoken name",
-                            call_id=getattr(session, "call_id", None),
-                            caller_name=name,
-                            source_transcript=utterance,
-                        )
-                        return name
+                name = self._operator_zero_extract_name_from_utterance(
+                    message.get("content") or ""
+                )
+                if name:
+                    return name
 
             # A caller will very commonly answer the initial Operator Zero
             # greeting with only their name:
@@ -9730,6 +9634,24 @@ class Engine:
                     or len(business_name.split()) > 12
                 ):
                     continue
+
+                # "Catching up with my friend" and personal locations do
+                # not identify an organization represented by the caller.
+                if _re.match(
+                    r"(?:my|your|his|her|our|their|a|an)\s+"
+                    r"(?:friend|colleague|neighbor|neighbour|wife|husband|partner|"
+                    r"mother|father|mom|dad|sister|brother|son|daughter|family)\b"
+                    r"|(?:home|work|next door|the house)\b",
+                    business_name,
+                    flags=_re.IGNORECASE,
+                ):
+                    continue
+                introduction = cleaned[:match.start(1)]
+                if not _re.search(r"\bcalling\s+(?:from|with)\s+$", introduction, _re.IGNORECASE):
+                    identity = _re.sub(r"\s+(?:from|with)\s+$", "", introduction, flags=_re.IGNORECASE)
+                    if not _re.fullmatch(r"i(?:['’]m| am)", identity, _re.IGNORECASE):
+                        if not self._operator_zero_extract_name_from_utterance(identity):
+                            continue
 
                 logger.info(
                     "Operator Zero learned explicit caller business name",
