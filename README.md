@@ -1494,8 +1494,9 @@ announcement field. A saved Business value is not reused as a caller's employer.
 Provider code still enforces audio-turn ordering, and the existing transfer state
 machine still controls completed playback, bridging, and trust.
 
-This source change is **not yet deployed**. Install the engine and revised
-incoming Agent prompt together; YAML alone does not update the active Agent.
+This change was **deployed September 14, 2026 at 22:34 Pacific**, with the engine
+and revised incoming Agent prompt updated together. Runtime checks passed;
+physical-phone verification remains outstanding. YAML alone does not update the active Agent.
 See the [screening change record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
 and [household user manual](https://github.com/thermionx/operator-zero/blob/main/docs/user-manual/Operator-Zero-User-Manual.pdf).
 

@@ -163,5 +163,16 @@ for the file inventory and rollout requirements.
 Full regression: **2653 passed, 11 skipped, 1 known pre-existing failure** in
 `test_session_response_task_can_be_cancelled_without_waiting_for_work`, reproduced
 on the unchanged baseline. All 10 text-only Realtime cases, 7 alias checks, and
-8 directory API tests passed. Code and templates are saved for release, but the
-live engine and Agent are unchanged; a physical phone test remains necessary.
+8 directory API tests passed. The engine and matching live Agent/YAML prompts
+were deployed September 14 at 22:34 Pacific. A physical phone test remains necessary.
+
+
+Deployment gate on the mini-PC's isolated `operator-zero-regression:20260905`
+image: **2615 passed, 23 skipped, zero failures** in 69.50 seconds, with no
+production credentials/runtime mounts and networking disabled. The exact live
+Agent prompt passed all **10 model cases** after redundant ordinary-screening
+instructions were consolidated. Unrelated Agent settings and YAML values were
+preserved. Only `ai_engine` restarted after a zero-call check; ARI registration,
+runtime prompt/greeting/tool checks, mocked Business learning, and startup error
+checks passed. Backup: `/home/brian/deployment-backups/required-reason-20260915-053211`.
+See the companion change record for rollback and outstanding handset checks.
