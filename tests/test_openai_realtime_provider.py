@@ -743,3 +743,33 @@ async def test_other_analog_routing_clears_ringback_before_execution(openai_conf
     provider.tool_adapter = SimpleNamespace(handle_tool_call_event=AsyncMock(side_effect=execute), send_tool_result=AsyncMock())
     await provider._handle_function_call({'item': {'name': 'dial_phone', 'call_id': 'dial-test', 'arguments': '{}'}})
     provider.tool_adapter.handle_tool_call_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["Tomorrow's lunch.", "It's personal.", "I'd rather not say. Connect me."])
+async def test_question_and_transfer_same_response_waits_for_new_caller_turn(openai_config, answer):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._context_name = "operator_zero_incoming"
+    provider._track_conversation = AsyncMock()
+    provider._emit_transcript = AsyncMock()
+    adapter = SimpleNamespace(handle_tool_call_event=AsyncMock(return_value={"status": "success"}), send_tool_result=AsyncMock())
+    provider.tool_adapter = adapter
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "name"})
+    event = _function_call_event("question-response", "premature", "blind_transfer")
+    done = provider._response_done_events["question-response"] = asyncio.Event()
+    task = asyncio.create_task(provider._handle_function_call(event))
+    await asyncio.sleep(0)
+    adapter.handle_tool_call_event.assert_not_awaited()
+    await provider._emit_assistant_transcript(
+        {"response_id": "question-response"}, "What are you calling about?", is_final=True
+    )
+    # The delayed NAME transcript must not count as an answer to the question.
+    await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "name", "transcript": "My name is Brian."})
+    done.set()
+    await asyncio.wait_for(task, 1)
+    adapter.handle_tool_call_event.assert_not_awaited()
+    # The next caller turn may provide a reason or decline; neither needs probing.
+    await provider._handle_event({"type": "input_audio_buffer.committed", "item_id": "answer"})
+    await provider._handle_event({"type": "conversation.item.input_audio_transcription.completed", "item_id": "answer", "transcript": answer})
+    await provider._handle_function_call(_function_call_event(None, "after-answer", "blind_transfer"))
+    adapter.handle_tool_call_event.assert_awaited_once()

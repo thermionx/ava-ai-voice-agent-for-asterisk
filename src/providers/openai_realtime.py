@@ -147,6 +147,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._input_transcription_events: dict[str, asyncio.Event] = {}
         self._failed_input_transcriptions: set[str] = set()
         self._latest_input_audio_item: Optional[str] = None
+        self._operator_zero_question_pending = False
+        self._operator_zero_question_input_item: Optional[str] = None
         # Recently-observed function_call IDs (call_id -> monotonic timestamp). Used by the
         # top-level error handler to decide whether an "invalid_tool_call_id" from the server
         # refers to a known-benign race we just waited through (downgrade to warning) or to
@@ -423,6 +425,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._output_resample_state = None
         self._output_resampler_logged = False
         self._assistant_transcript_buffers.clear()
+        self._operator_zero_question_pending = False
+        self._operator_zero_question_input_item = None
         self._closing = False
         self._closed = False
         
@@ -889,7 +893,17 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 or (getattr(self, "_context_name", None) == "operator_zero"
                     and function_name in {"dial_phone", "dial_inside"})
             ):
+                # Finish collecting this response before allowing its tools to
+                # act: it may contain both a spoken question and a transfer.
+                await self._await_parent_response_done(event_data, function_name=function_name)
                 await self._await_operator_zero_input_transcripts()
+                if (getattr(self, "_context_name", None) == "operator_zero_incoming"
+                        and self._operator_zero_question_pending
+                        and self._operator_zero_question_input_item == self._latest_input_audio_item):
+                    raise RuntimeError(
+                        "Wait silently for the caller to answer the question you just asked. "
+                        "Do not repeat it or transfer yet. A brief answer or refusal is enough."
+                    )
             # A different routing request supersedes an analog ring-on-hangup request.
             if (getattr(self, "_context_name", None) == "operator_zero"
                     and getattr(self, "_caller_number", None) in {"102", "103"}
@@ -2832,6 +2846,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             complete += part
         if not complete:
             return
+        if getattr(self, "_context_name", None) == "operator_zero_incoming" and "?" in complete:
+            # Use the input item, not transcript arrival order: the name's
+            # transcription can arrive after the operator asks the next question.
+            self._operator_zero_question_pending = True
+            self._operator_zero_question_input_item = self._latest_input_audio_item
         await self._track_conversation("assistant", complete)
         await self._emit_transcript(complete, is_final=True)
 
