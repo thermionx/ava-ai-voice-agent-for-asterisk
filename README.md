@@ -1496,8 +1496,8 @@ announcement field. A saved Business value is not reused as a caller's employer.
 Provider code still enforces audio-turn ordering, and the existing transfer state
 machine still controls completed playback, bridging, and trust.
 
-The shared-facts foundation was deployed September 14 at 22:34 Pacific. The
-business-or-reason clarification is validated locally and awaiting deployment;
+The business-or-reason clarification was **deployed September 14, 2026 at
+23:01 Pacific**, with matching engine and Agent prompts. Runtime checks passed;
 physical-phone verification remains outstanding. YAML alone does not update the active Agent.
 See the [screening change record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
 and [household user manual](https://github.com/thermionx/operator-zero/blob/main/docs/user-manual/Operator-Zero-User-Manual.pdf).

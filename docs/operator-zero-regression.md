@@ -178,7 +178,7 @@ checks passed. Backup: `/home/brian/deployment-backups/required-reason-20260915-
 See the companion change record for rollback and outstanding handset checks.
 
 
-### Latest clarification: business OR reason (deployment pending)
+### Latest clarification: business OR reason
 
 Brian clarified that a business name or a reason is enough for ordinary calls.
 Deliveries and appointments qualify without a business. Personal caller and
@@ -188,3 +188,16 @@ still needs service identity and purpose. Local regression: 2669 passed,
 11 skipped, the known baseline cancellation failure. Eight directory tests pass.
 README, manual revision 1.2, and source/recovery prompts are synchronized.
 See docs/screening-simplification.md for files, deployment, and phone checks.
+
+
+Latest correction deployed September 14 at **23:01 Pacific**: AVA `28502aa0`
+accepts a business name OR reason. Deliveries and appointments need no company.
+Business stores the reason, otherwise the business name. All 14 prompt cases
+and 8 directory tests passed; mini-PC full regression: 2631 passed, 23 skipped,
+zero failures. Local full regression: 2669 passed, 11 skipped, the known baseline
+cancellation failure. Only ai_engine restarted, with zero calls, verified live
+prompts/source, successful runtime admission/Business checks, ARI registration,
+and zero startup errors. Backup:
+/home/brian/deployment-backups/business-or-reason-20260915-060005.
+README and manual revision 1.2 are current. Physical outside-call verification
+remains outstanding. See docs/screening-simplification.md for files and rollback.
