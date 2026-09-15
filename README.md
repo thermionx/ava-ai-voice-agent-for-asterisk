@@ -1499,7 +1499,7 @@ machine still controls completed playback, bridging, and trust.
 
 The business-or-reason clarification was **deployed September 14, 2026 at
 23:01 Pacific**, with matching engine and Agent prompts. Runtime checks passed;
-physical-phone verification remains outstanding. YAML alone does not update the active Agent.
+Brian confirmed the latest delivery/appointment phone test worked. YAML alone does not update the active Agent.
 See the [screening change record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
 and [household user manual](https://github.com/thermionx/operator-zero/blob/main/docs/user-manual/Operator-Zero-User-Manual.pdf).
 
@@ -1603,4 +1603,7 @@ phonebook. See the [server and phone setup guide](https://github.com/thermionx/o
 caller name when calling about a delivery or appointment. The intended household
 recipient is still required. Other ordinary calls still need a personal name.
 This exception was deployed September 14, 2026 at 23:19 Pacific. Automated and
-runtime checks passed; physical-call validation remains outstanding.
+runtime checks passed; Brian confirmed the physical call worked.
+
+Brian confirmed the delivery/appointment business-identity phone test worked on
+September 14, 2026. The phone-test follow-up is complete.

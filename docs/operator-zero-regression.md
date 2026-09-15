@@ -229,3 +229,12 @@ change in this clarification. Physical outside-call validation remains needed.
 
 
 Deployed the delivery/appointment business-identity exception September 14 at 23:19 Pacific (AVA 6300fee3). All 17 model checks passed. Local full suite: 2681 passed, 11 skipped, known baseline cancellation failure. Mini-PC gate: 2643 passed, 23 skipped, 94 warnings in 69.75s (0:01:09). Only ai_engine restarted; live prompt/source, admission, announcement, mocked directory learning, ARI registration, and startup checks passed. Backup: /home/brian/deployment-backups/business-identity-20260915-061746. Manual revision 1.3 is current. Physical phone verification remains outstanding. See the Operator Zero docs/screening-simplification.md deployment record for file inventory and rollback.
+
+
+### Phone test confirmed
+
+Brian confirmed the deployed delivery/appointment business-identity flow worked
+on September 14, 2026. The physical-call follow-up is complete. This confirmation
+supersedes the earlier pending phone-test notes; it does not claim a separate
+audit of the resulting directory record. The deployed code and prompts are
+unchanged (AVA `6300fee3`, deployed at 23:19 Pacific).
