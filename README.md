@@ -1602,4 +1602,5 @@ phonebook. See the [server and phone setup guide](https://github.com/thermionx/o
 **Delivery/appointment clarification:** a business name replaces the personal
 caller name when calling about a delivery or appointment. The intended household
 recipient is still required. Other ordinary calls still need a personal name.
-This exception is awaiting deployment; the business-or-reason policy is already live.
+This exception was deployed September 14, 2026 at 23:19 Pacific. Automated and
+runtime checks passed; physical-call validation remains outstanding.
