@@ -1285,7 +1285,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             td_config: Dict[str, Any] = {
                 "type": "server_vad",
                 "create_response": True,
-                "interrupt_response": True,
+                # Protect the first greeting before caller audio can reach VAD.
+                # A local speech_started guard cannot undo server cancellation.
+                "interrupt_response": not (
+                    (self.config.greeting or "").strip()
+                    and not self._greeting_interruptible
+                    and not self._greeting_completed
+                ),
             }
             if getattr(self.config, "turn_detection", None):
                 try:
@@ -1422,15 +1428,30 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             getattr(self.config, "greeting_interruptible", False)
         )
 
-        # Per OpenAI Dec 2024 docs: Disable turn_detection during greeting
-        # to prevent user speech from interrupting the greeting
         logger.info(
-            "🔇 Disabling turn_detection for greeting playback",
-            call_id=self._call_id
+            "Configuring provider interruption for greeting playback",
+            call_id=self._call_id,
+            greeting_interruptible=self._greeting_interruptible,
         )
         
-        # Disable VAD before greeting (Beta only - GA doesn't accept turn_detection)
-        if not self._is_ga:
+        if self._is_ga:
+            # GA accepts this setting under audio.input, not at session level.
+            # Keep VAD/transcription active so early caller speech is preserved.
+            greeting_vad = {"type": "server_vad", "create_response": True,
+                            "interrupt_response": self._greeting_interruptible}
+            td = getattr(self.config, "turn_detection", None)
+            if td is not None:
+                greeting_vad.update({"type": td.type, "threshold": td.threshold,
+                                     "silence_duration_ms": td.silence_duration_ms,
+                                     "prefix_padding_ms": td.prefix_padding_ms})
+            await self._send_json({
+                "type": "session.update",
+                "event_id": f"sess-greeting-vad-{uuid.uuid4()}",
+                "session": self._ga_session_type({
+                    "audio": {"input": {"turn_detection": greeting_vad}},
+                }),
+            })
+        else:
             disable_vad_payload: Dict[str, Any] = {
                 "type": "session.update",
                 "event_id": f"sess-disable-vad-{uuid.uuid4()}",
@@ -1534,10 +1555,20 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.debug("Failed to build turn_detection config, using OpenAI defaults", 
                            call_id=self._call_id, exc_info=True)
         
-        # GA API does not accept turn_detection in session.update; skip entirely
+        # Restore automatic interruption after generation. The separate transport
+        # guard still protects greeting audio queued for the caller.
         if self._is_ga:
+            turn_detection_config = turn_detection_config or {"type": "server_vad"}
+            turn_detection_config.update({"create_response": True, "interrupt_response": True})
+            await self._send_json({
+                "type": "session.update",
+                "event_id": f"sess-enable-vad-{uuid.uuid4()}",
+                "session": self._ga_session_type({
+                    "audio": {"input": {"turn_detection": turn_detection_config}},
+                }),
+            })
             logger.info(
-                "🔊 GA mode: skipping turn_detection re-enable (server manages VAD)",
+                "GA turn_detection restored after greeting generation",
                 call_id=self._call_id,
             )
         else:
@@ -2165,7 +2196,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.info(
                     "✅ Greeting response completed - re-enabling turn_detection",
                     call_id=self._call_id,
-                    had_audio=had_audio_for_response
+                    had_audio=had_audio_for_response,
+                    response_status=(event.get("response") or {}).get("status"),
+                    status_details=(event.get("response") or {}).get("status_details"),
                 )
                 # Re-enable turn_detection now that greeting is fully generated
                 await self._re_enable_vad()
