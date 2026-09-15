@@ -107,12 +107,15 @@ class ScreeningFacts:
                    "family member", "head of household", "homeowner", "someone there", "anyone there"}
         recipient = " ".join(self.recipient.lower().replace("_", " ").replace("-", " ").split())
         if recipient and recipient not in generic:
-            if not self.caller_name:
-                return ScreeningDecision("ASK_CALLER", "The caller must identify themselves before a household transfer.")
-            if not spoken(self.recipient, name=True):
-                return ScreeningDecision("ASK_RECIPIENT", "The named recipient was not stated by the caller.")
             has_reason = bool(self.reason) and spoken(self.reason) and not is_reason_refusal(self.reason)
             has_business = bool(self.company) and spoken(self.company) and not is_reason_refusal(self.company)
+            business_identity = has_business and has_reason and bool(
+                re.search(r"\b(?:deliver(?:y|ies|ing)|appointments?)\b", self.reason, re.IGNORECASE)
+            )
+            if not self.caller_name and not business_identity:
+                return ScreeningDecision("ASK_CALLER", "Obtain the caller's personal name; for a stated delivery or appointment, a caller-stated business name is sufficient instead.")
+            if not spoken(self.recipient, name=True):
+                return ScreeningDecision("ASK_RECIPIENT", "The named recipient was not stated by the caller.")
             if not (has_reason or has_business):
                 return ScreeningDecision(
                     "ASK_REASON",

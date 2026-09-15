@@ -201,3 +201,28 @@ and zero startup errors. Backup:
 /home/brian/deployment-backups/business-or-reason-20260915-060005.
 README and manual revision 1.2 are current. Physical outside-call verification
 remains outstanding. See docs/screening-simplification.md for files and rollback.
+
+
+### Delivery and appointment caller identity
+
+For a stated delivery or appointment, a caller-stated business name replaces the
+personal caller name. The named household recipient is still required. Announce
+the business and purpose; omit an unprovided personal name. With no business,
+a personal name and delivery/appointment reason still suffice. Other ordinary
+calls continue to require a personal name. Business storage and trust rules are
+unchanged. This clarification is awaiting deployment.
+
+Local full regression: 2681 passed, 11 skipped, the known baseline cancellation
+failure. Changed code: `src/core/operator_zero_screening.py` adds the supported
+business/purpose identity exception; `src/tools/telephony/unified_transfer.py`
+explains it in tool parameters. Regression cases cover accepted purposes,
+unsupported company/purpose/recipient, other businesses, and the actual handoff
+and announcement without a personal name. Those cases are in
+`tests/test_operator_zero_screening.py` and
+`tests/tools/telephony/test_unified_transfer_tool.py`.
+
+Source updates also include the canonical incoming prompt, both public/private
+YAML prompt copies, ignored local provider config, prompt checker, READMEs,
+manual HTML/PDF (revision 1.3), and policy/deployment records. The exact file
+inventory is in the preceding records; only the two production files above
+change in this clarification. Physical outside-call validation remains needed.

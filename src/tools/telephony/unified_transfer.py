@@ -75,7 +75,7 @@ class UnifiedTransferTool(Tool):
                         "Company, organization, emergency service, hospital, "
                         "police/fire department, or other organization the "
                         "caller identified, when known. For ordinary Operator Zero calls, "
-                        "a business name is sufficient without a separate reason."
+                        "a business name is sufficient without a separate reason. For a stated delivery or appointment, it also replaces the personal caller name."
                     ),
                     required=False
                 ),

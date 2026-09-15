@@ -1479,7 +1479,8 @@ code must enforce the telephone lifecycle.
 
 ### Shared incoming screening facts
 
-Ordinary Operator Zero screening requires the caller's personal name, a named
+Ordinary Operator Zero screening requires caller identity (a personal name, or a
+business for delivery/appointment calls), a named
 recipient, and either a caller-stated business name or a broad reason. “I want to talk with Brian,” “I'm a
 friend,” and “we met once” are sufficient. Deliveries and appointments need no business name; a business
 name alone needs no separate reason. The prompt asks only for missing facts,
@@ -1596,3 +1597,9 @@ The **Trusted Callers** sidebar page manages the household approval list backed
 by Operator Zero memory, including contacts that have not called yet. Its DP755
 setup panel connects DP725 handsets to the same list through a read-only XML
 phonebook. See the [server and phone setup guide](https://github.com/thermionx/operator-zero/blob/main/docs/trusted-callers.md).
+
+
+**Delivery/appointment clarification:** a business name replaces the personal
+caller name when calling about a delivery or appointment. The intended household
+recipient is still required. Other ordinary calls still need a personal name.
+This exception is awaiting deployment; the business-or-reason policy is already live.

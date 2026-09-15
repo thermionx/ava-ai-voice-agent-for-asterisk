@@ -81,3 +81,23 @@ def test_business_does_not_waive_names_or_official_purpose():
 def test_official_service_still_needs_a_nonrefused_purpose(reason):
     facts = ScreeningFacts(company='Lafayette Police', reason=reason)
     assert facts.next_action([{'role': 'user', 'content': 'Lafayette Police. ' + reason}]).action == 'ASK_RECIPIENT'
+
+
+@pytest.mark.parametrize('reason', ['a delivery', 'delivering a package', 'deliveries', 'an appointment', 'appointments'])
+def test_delivery_or_appointment_business_replaces_personal_name(reason):
+    facts = ScreeningFacts(recipient='Brian', company='Acme', reason=reason)
+    history = [{'role': 'user', 'content': 'Acme calling for Brian about ' + reason}]
+    assert facts.next_action(history).action == 'TRANSFER'
+    assert facts.announcement == 'Acme is on the line. Reason for calling: ' + reason
+
+
+@pytest.mark.parametrize('company,reason,spoken,expected', [
+    ('Acme', 'a delivery', 'Brian about a delivery', 'ASK_CALLER'),
+    ('Acme', 'an appointment', 'Acme for Brian', 'ASK_CALLER'),
+    ('Acme', 'a sales call', 'Acme for Brian about a sales call', 'ASK_CALLER'),
+    ('', 'a delivery', 'Brian about a delivery', 'ASK_CALLER'),
+    ('Acme', 'a delivery', 'Acme about a delivery', 'ASK_RECIPIENT'),
+])
+def test_business_identity_exception_requires_supported_business_purpose_and_recipient(company, reason, spoken, expected):
+    facts = ScreeningFacts(recipient='Brian', company=company, reason=reason)
+    assert facts.next_action([{'role': 'user', 'content': spoken}]).action == expected
