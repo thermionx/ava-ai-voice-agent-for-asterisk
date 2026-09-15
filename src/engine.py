@@ -6996,6 +6996,7 @@ class Engine:
                         # Prefer identity explicitly supplied by the AI with
                         # blind_transfer. OpenAI may understand the caller
                         # correctly even when no input transcript is emitted.
+                        call_reason = ""
                         try:
                             transfer_payload = (
                                 action.get("payload")
@@ -7043,6 +7044,12 @@ class Engine:
                             if supplied_business:
                                 business_name = supplied_business
 
+                            call_reason = str(
+                                transfer_identity.get("reason")
+                                or latest_identity_action.get("reason")
+                                or ""
+                            ).strip()
+
                             if supplied_name or supplied_business:
                                 logger.info(
                                     "Operator Zero predial using transfer-supplied identity",
@@ -7086,6 +7093,8 @@ class Engine:
                         first_admission = previous_acceptance_count == 0
 
                         announcement_text = f"{announcement_identity} is on the line."
+                        if call_reason:
+                            announcement_text += f" Reason for calling: {call_reason}"
 
                         logger.info(
                             "Operator Zero predial finalize private announcement",

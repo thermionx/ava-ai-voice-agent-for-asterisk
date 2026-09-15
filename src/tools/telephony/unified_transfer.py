@@ -91,8 +91,10 @@ class UnifiedTransferTool(Tool):
                     name="reason",
                     type="string",
                     description=(
-                        "Specific emergency or official reason for the call, "
-                        "when the caller is not asking for a named person."
+                        "Caller's stated reason for calling, in their own words, "
+                        "for the private announcement to the inside phone. Optional "
+                        "for ordinary calls: omit if not given or declined. Required "
+                        "for an emergency/official call without a named recipient."
                     ),
                     required=False
                 )
@@ -384,6 +386,7 @@ class UnifiedTransferTool(Tool):
                 "recipient": str(
                     operator_zero_metadata.get("recipient") or ""
                 ).strip(),
+                "reason": str(operator_zero_metadata.get("reason") or "").strip(),
             }
             session.current_action = (
                 OperatorZeroTransferState.start(predial_action).action
@@ -469,6 +472,9 @@ class UnifiedTransferTool(Tool):
                 announcement_identity = caller_name or business_name
 
             announcement_text = f"{announcement_identity} is on the line."
+            call_reason = str(operator_zero_metadata.get("reason") or "").strip()
+            if call_reason:
+                announcement_text += f" Reason for calling: {call_reason}"
 
             engine = getattr(context.ari_client, "engine", None)
             if engine and hasattr(engine, "_local_ai_server_tts"):
@@ -671,6 +677,13 @@ class UnifiedTransferTool(Tool):
                 )
                 return {"status": "failed", "message": screening_error,
                         "next_action": "Offer voicemail. If the caller accepts, invoke leave_voicemail. Do not repeat the unchanged transfer."}
+            # Ordinary-call reasons are optional. Never announce a model-invented
+            # reason, but do not reject an otherwise screened call over it.
+            # Official-call reasons have already passed the stricter check above.
+            if screening_metadata.get("reason") and not self._screening_value_was_spoken(
+                screening_metadata["reason"], list(getattr(session, "conversation_history", None) or [])
+            ):
+                screening_metadata.pop("reason")
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}

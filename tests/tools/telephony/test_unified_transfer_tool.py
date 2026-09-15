@@ -2,6 +2,7 @@
 Unit tests for UnifiedTransferTool destination resolution.
 """
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock
 
@@ -11,6 +12,43 @@ from src.tools.telephony.unified_transfer import UnifiedTransferTool
 
 
 class TestUnifiedTransferTool:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason,spoken,expected_reason", [
+        ("Tomorrow's lunch", "Tomorrow's lunch", "Tomorrow's lunch"),
+        ("It's personal", "It's personal", "It's personal"),
+        ("", "I'd rather not say", ""),
+        ("collecting a payment", "I want to talk to Brian", ""),
+    ])
+    async def test_optional_reason_reaches_predial_announcement_only_when_spoken(
+        self, tool, tool_context, mock_ari_client, reason, spoken, expected_reason
+    ):
+        tool_context.context_name = "operator_zero_incoming"
+        session = tool_context.session_store.get_by_call_id.return_value
+        session.conversation_history = [{"role": "user", "content": "I'm Bob calling for Brian. " + spoken}]
+        tool_context.get_session = AsyncMock(return_value=session)
+        engine = Mock()
+        engine._local_ai_server_tts = AsyncMock(return_value=b"audio")
+        engine._operator_zero_predial_announcement_cache = {}
+        mock_ari_client.engine = engine
+        tool_context.config["tools"]["transfer"] = {
+            "deferred_strategy": "predial_then_bridge",
+            "destinations": {"inside_phone": {"type": "extension", "target": "100"}},
+        }
+        result = await tool.execute({"destination": "inside_phone", "caller_name": "Bob",
+                                     "recipient": "Brian", "reason": reason}, tool_context)
+        assert result["status"] == "success"
+        action = result[DEFERRED_TRANSFER_RESULT_KEY]
+        assert action["payload"]["operator_zero"].get("reason", "") == expected_reason
+        assert session.current_action["reason"] == expected_reason
+        await asyncio.sleep(0)
+        text = "Bob is on the line."
+        if expected_reason:
+            text += " Reason for calling: " + expected_reason
+        engine._local_ai_server_tts.assert_awaited_once_with(
+            call_id=tool_context.call_id, text=text, timeout_sec=8.0
+        )
+        assert engine._operator_zero_predial_announcement_cache[tool_context.call_id]["text"] == text
+
     @pytest.fixture
     def tool(self, mock_ari_client):
         mock_ari_client.dialplan_target_exists = AsyncMock(return_value=True)

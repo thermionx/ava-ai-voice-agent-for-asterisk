@@ -764,7 +764,8 @@ async def test_predial_transfer_finalize_is_serialized():
 
 
 @pytest.mark.asyncio
-async def test_operator_zero_announcement_claim_cannot_bridge_before_playback():
+@pytest.mark.parametrize("reason", ["", "Tomorrow's lunch"])
+async def test_operator_zero_announcement_claim_cannot_bridge_before_playback(reason):
     engine = _build_engine({"enabled": True, "predial_bridge_wait_timeout_sec": 2})
     call_id = "call-operator-zero-announcement-race"
     destination_channel = "SIP/100-00000001"
@@ -780,6 +781,7 @@ async def test_operator_zero_announcement_claim_cannot_bridge_before_playback():
             "target": "100",
             "target_name": "Inside phone",
             "predial_channel_id": destination_channel,
+            "reason": reason,
         }
     ).destination_answered(destination_channel)
     session.current_action = state.action
@@ -832,7 +834,10 @@ async def test_operator_zero_announcement_claim_cannot_bridge_before_playback():
     second = asyncio.create_task(engine.finalize_predial_transfer(context, action))
     await asyncio.sleep(0.1)
 
-    assert tts_calls == ["Bob is on the line."]
+    announcement = "Bob is on the line."
+    if reason:
+        announcement += " Reason for calling: " + reason
+    assert tts_calls == [announcement]
     assert add_calls == []
 
     release_tts.set()
