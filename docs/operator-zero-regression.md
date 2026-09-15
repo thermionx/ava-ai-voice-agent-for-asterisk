@@ -144,3 +144,24 @@ already matched this working copy. Synchronization publishes that source
 and brings deployment documentation and tests up to date; it introduces
 no additional call-control behavior change. Real-phone validation and the
 22 skipped tests remain outside this automated result.
+
+## Required broad reason and shared screening facts (September 2026)
+
+The ordinary-call contract now requires a caller-stated reason. A relationship
+or a request to speak to the named recipient is sufficient; no detailed purpose
+is required. Refusal or an unsupported reason blocks transfer and leads to a
+voicemail offer. This intentionally replaces the earlier optional-reason contract.
+
+`ScreeningFacts.next_action()` centralizes evidence checks. The predial action
+carries the same facts into prepared/final announcements and accepted-call
+learning. The reason becomes directory Business; the personal name is separate.
+The provider's response-completion/audio-item guard and private-playback/bridge
+state machine remain in place. See the companion
+[implementation record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
+for the file inventory and rollout requirements.
+
+Full regression: **2653 passed, 11 skipped, 1 known pre-existing failure** in
+`test_session_response_task_can_be_cancelled_without_waiting_for_work`, reproduced
+on the unchanged baseline. All 10 text-only Realtime cases, 7 alias checks, and
+8 directory API tests passed. Code and templates are saved for release, but the
+live engine and Agent are unchanged; a physical phone test remains necessary.

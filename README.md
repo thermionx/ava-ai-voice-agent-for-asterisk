@@ -1477,6 +1477,28 @@ what makes a transfer successful, or how overlapping playback and hangup events
 are handled requires executable code. Prompts guide conversation; call-control
 code must enforce the telephone lifecycle.
 
+### Shared incoming screening facts
+
+Ordinary Operator Zero screening requires the caller's personal name, a named
+recipient, and a broad caller-stated reason. “I want to talk with Brian,” “I'm a
+friend,” and “we met once” are sufficient. The prompt asks only for missing facts,
+waits for a reply, and offers voicemail when the caller refuses a reason. These
+examples guide conversation; they are not an allowlist of acceptable reasons.
+
+[`ScreeningFacts`](src/core/operator_zero_screening.py) centralizes transcript
+evidence checks and the next-action decision. The transfer tool persists one
+screening record for prepared/final announcements and directory learning. One
+formatter produces both announcement versions. The reason is saved in directory
+**Business** after acceptance and connection; company remains a separate optional
+announcement field. A saved Business value is not reused as a caller's employer.
+Provider code still enforces audio-turn ordering, and the existing transfer state
+machine still controls completed playback, bridging, and trust.
+
+This source change is **not yet deployed**. Install the engine and revised
+incoming Agent prompt together; YAML alone does not update the active Agent.
+See the [screening change record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
+and [household user manual](https://github.com/thermionx/operator-zero/blob/main/docs/user-manual/Operator-Zero-User-Manual.pdf).
+
 ### Why this fork changes AVA code
 
 AVA supplies the general voice-agent platform. Operator Zero extends it for the
@@ -1497,6 +1519,8 @@ The main implementation areas are:
 
 - [`src/engine.py`](src/engine.py): call lifecycle, screening identity,
   announcement playback, transfer coordination, trust integration, and cleanup.
+- [`src/core/operator_zero_screening.py`](src/core/operator_zero_screening.py):
+  shared screening facts, admission decisions, and announcement formatting.
 - [`src/core/operator_zero_state.py`](src/core/operator_zero_state.py): explicit
   state for the Operator Zero predial handoff.
 - [`src/tools/telephony/`](src/tools/telephony/): transfer, deferred-action,

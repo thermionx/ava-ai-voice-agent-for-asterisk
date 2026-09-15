@@ -23,11 +23,14 @@ def test_external_screening_to_single_announcement_and_transfer():
     assert {"caller_channel", "inside_channel", "mixing_bridge"} <= call.resources
 
 
-def test_name_and_specific_recipient_are_sufficient_without_purpose():
+def test_name_and_recipient_require_a_broad_caller_stated_reason():
     history = [{"role": "user", "content": "This is Bob. I need Brian."}]
     assert UnifiedTransferTool._validate_operator_zero_screening(
-        {"caller_name": "Bob", "recipient": "Brian", "reason": ""}, history
+        {"caller_name": "Bob", "recipient": "Brian", "reason": "I need Brian"}, history
     ) is None
+    assert "reason is required" in UnifiedTransferTool._validate_operator_zero_screening(
+        {"caller_name": "Bob", "recipient": "Brian", "reason": ""}, history
+    )
 
 
 def test_unknown_caller_cannot_use_generic_household_role():

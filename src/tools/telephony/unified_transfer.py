@@ -7,7 +7,6 @@ This tool implements the canonical `blind_transfer` tool and replaces the legacy
 
 from typing import Dict, Any, Optional, Tuple, List
 import asyncio
-import re
 import structlog
 
 from ..base import Tool, ToolDefinition, ToolParameter, ToolCategory
@@ -19,6 +18,7 @@ from .deferred_transfer import (
     transfer_deferral_enabled,
 )
 from ...core.operator_zero_state import OperatorZeroTransferState
+from ...core.operator_zero_screening import ScreeningFacts, value_was_spoken
 
 logger = structlog.get_logger(__name__)
 
@@ -92,9 +92,10 @@ class UnifiedTransferTool(Tool):
                     type="string",
                     description=(
                         "Caller's stated reason for calling, in their own words, "
-                        "for the private announcement to the inside phone. Optional "
-                        "for ordinary calls: omit if not given or declined. Required "
-                        "for an emergency/official call without a named recipient."
+                        "for the private announcement and directory Business field. Required "
+                        "for Operator Zero incoming calls. Broad reasons such as "
+                        "I want to talk with Brian, I am a friend, or we met once "
+                        "are sufficient. A refusal is not a reason."
                     ),
                     required=False
                 )
@@ -105,102 +106,12 @@ class UnifiedTransferTool(Tool):
     def _normalize_text(value: str) -> str:
         return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split())
 
-    @classmethod
-    def _screening_value_was_spoken(cls, value: str, history: List[Dict[str, Any]], *, name_aliases: Any = None) -> bool:
-        def normalize(raw: Any) -> str:
-            return " ".join(re.sub(r"[^a-z0-9]+", " ", str(raw or "").lower()).split())
-
-        # Aliases are household configuration, never model/tool arguments.
-        # Invalid or ambiguous mappings fall back to exact transcript matching.
-        replacements = {}
-        valid = isinstance(name_aliases, dict)
-        if valid:
-            for canonical, variants in name_aliases.items():
-                if not isinstance(canonical, str) or not normalize(canonical) or not isinstance(variants, list):
-                    valid = False
-                    break
-                target = normalize(canonical)
-                for variant in [canonical, *variants]:
-                    if not isinstance(variant, str) or not normalize(variant):
-                        valid = False
-                        break
-                    alias = normalize(variant)
-                    if alias in replacements and replacements[alias] != target:
-                        valid = False
-                        break
-                    replacements[alias] = target
-                if not valid:
-                    break
-        pattern = None
-        if valid and replacements:
-            pattern = re.compile(r"\b(?:" + "|".join(
-                re.escape(alias) for alias in sorted(replacements, key=len, reverse=True)
-            ) + r")\b")
-
-        def evidence_text(raw: Any) -> str:
-            text = normalize(raw)
-            # One pass prevents alias replacements from cascading.
-            return pattern.sub(lambda match: replacements[match.group(0)], text) if pattern else text
-
-        needle = evidence_text(value)
-        if not needle:
-            return False
-        caller_text = " ".join(
-            evidence_text(message.get("content", ""))
-            for message in history
-            if isinstance(message, dict) and message.get("role") == "user"
-        )
-        return f" {needle} " in f" {caller_text} "
+    _screening_value_was_spoken = staticmethod(value_was_spoken)
 
     @classmethod
-    def _validate_operator_zero_screening(
-        cls,
-        metadata: Dict[str, str],
-        history: List[Dict[str, Any]],
-        name_aliases: Any = None,
-    ) -> Optional[str]:
-        """Fail closed when the model invents incoming-call screening facts."""
-        caller_name = metadata.get("caller_name", "")
-        recipient = metadata.get("recipient", "")
-        company = metadata.get("company", "")
-        reason = metadata.get("reason", "")
-
-        if caller_name and not cls._screening_value_was_spoken(caller_name, history, name_aliases=name_aliases):
-            return "The caller's identity was not confirmed in the conversation."
-
-        generic_recipients = {
-            "household", "household member", "member of the household",
-            "family", "family member", "head of household", "homeowner",
-            "someone there", "anyone there",
-        }
-        recipient_normalized = cls._normalize_text(recipient)
-        named_recipient = bool(recipient_normalized) and recipient_normalized not in generic_recipients
-        if named_recipient:
-            if not caller_name:
-                return "The caller must identify themselves before a household transfer."
-            if not cls._screening_value_was_spoken(recipient, history, name_aliases=name_aliases):
-                return "The named recipient was not stated by the caller."
-            return None
-
-        # The only no-name exception is a caller-stated emergency or official
-        # service purpose. Requiring both fields keeps a bare model assertion
-        # from opening the household transfer boundary.
-        official_terms = {
-            "police", "sheriff", "fire department", "ambulance", "ems",
-            "hospital", "doctor", "medical", "court", "government",
-            "emergency services",
-        }
-        organization_is_official = any(
-            term in cls._normalize_text(company) for term in official_terms
-        )
-        if (
-            organization_is_official
-            and reason
-            and cls._screening_value_was_spoken(company, history)
-            and cls._screening_value_was_spoken(reason, history)
-        ):
-            return None
-        return "A specific named recipient or a confirmed emergency/official reason is required."
+    def _validate_operator_zero_screening(cls, metadata, history, name_aliases=None):
+        decision = ScreeningFacts.from_metadata(metadata).next_action(history, name_aliases)
+        return decision.message or None
 
     @staticmethod
     def _resolve_dialplan_context(
@@ -388,6 +299,8 @@ class UnifiedTransferTool(Tool):
                 ).strip(),
                 "reason": str(operator_zero_metadata.get("reason") or "").strip(),
             }
+            if self._normalize_text(context.context_name or "") == "operator zero incoming":
+                predial_action["screening_facts"] = ScreeningFacts.from_metadata(operator_zero_metadata).to_metadata()
             session.current_action = (
                 OperatorZeroTransferState.start(predial_action).action
                 if operator_zero_metadata
@@ -466,15 +379,7 @@ class UnifiedTransferTool(Tool):
         ).strip()
 
         if caller_name or business_name:
-            if caller_name and business_name:
-                announcement_identity = f"{caller_name} from {business_name}"
-            else:
-                announcement_identity = caller_name or business_name
-
-            announcement_text = f"{announcement_identity} is on the line."
-            call_reason = str(operator_zero_metadata.get("reason") or "").strip()
-            if call_reason:
-                announcement_text += f" Reason for calling: {call_reason}"
+            announcement_text = ScreeningFacts.from_metadata(operator_zero_metadata).announcement
 
             engine = getattr(context.ari_client, "engine", None)
             if engine and hasattr(engine, "_local_ai_server_tts"):
@@ -663,27 +568,20 @@ class UnifiedTransferTool(Tool):
 
         if self._normalize_text(context.context_name or "") == "operator zero incoming":
             session = await context.get_session()
-            screening_error = self._validate_operator_zero_screening(
-                screening_metadata,
-                list(getattr(session, "conversation_history", None) or []),
-                name_aliases=context.get_config_value("tools.transfer.screening_name_aliases"),
+            history = list(getattr(session, "conversation_history", None) or [])
+            facts = ScreeningFacts.from_metadata(screening_metadata)
+            decision = facts.next_action(
+                history, context.get_config_value("tools.transfer.screening_name_aliases")
             )
-            if screening_error:
-                logger.warning(
-                    "Operator Zero rejected unsupported incoming transfer",
-                    call_id=context.call_id,
-                    reason=screening_error,
-                    metadata=screening_metadata,
-                )
-                return {"status": "failed", "message": screening_error,
-                        "next_action": "Offer voicemail. If the caller accepts, invoke leave_voicemail. Do not repeat the unchanged transfer."}
-            # Ordinary-call reasons are optional. Never announce a model-invented
-            # reason, but do not reject an otherwise screened call over it.
-            # Official-call reasons have already passed the stricter check above.
-            if screening_metadata.get("reason") and not self._screening_value_was_spoken(
-                screening_metadata["reason"], list(getattr(session, "conversation_history", None) or [])
-            ):
-                screening_metadata.pop("reason")
+            if decision.action != "TRANSFER":
+                logger.warning("Operator Zero rejected unsupported incoming transfer",
+                               call_id=context.call_id, reason=decision.message)
+                return {"status": "failed", "message": decision.message,
+                        "screening_action": decision.action,
+                        "next_action": decision.message + " Do not retry unchanged facts. Offer voicemail if the caller declines."}
+            # Company remains a separate organization claim; Business stores reason.
+            if facts.company and not value_was_spoken(facts.company, history):
+                screening_metadata.pop("company", None)
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}

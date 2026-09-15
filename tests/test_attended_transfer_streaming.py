@@ -765,7 +765,8 @@ async def test_predial_transfer_finalize_is_serialized():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["", "Tomorrow's lunch"])
-async def test_operator_zero_announcement_claim_cannot_bridge_before_playback(reason):
+@pytest.mark.parametrize("screened", [False, True])
+async def test_operator_zero_announcement_claim_cannot_bridge_before_playback(reason, screened):
     engine = _build_engine({"enabled": True, "predial_bridge_wait_timeout_sec": 2})
     call_id = "call-operator-zero-announcement-race"
     destination_channel = "SIP/100-00000001"
@@ -785,6 +786,8 @@ async def test_operator_zero_announcement_claim_cannot_bridge_before_playback(re
         }
     ).destination_answered(destination_channel)
     session.current_action = state.action
+    if screened:
+        session.current_action["screening_facts"] = {"caller_name": "Bob", "recipient": "Brian", "reason": reason}
     await engine.session_store.upsert_call(session)
 
     tts_started = asyncio.Event()
@@ -793,9 +796,11 @@ async def test_operator_zero_announcement_claim_cannot_bridge_before_playback(re
     add_calls = []
 
     async def fake_extract_name(_session):
+        assert not screened, "screened calls must use persisted facts"
         return "Bob"
 
     async def fake_extract_business(_session):
+        assert not screened, "screened calls must use persisted facts"
         return ""
 
     async def fake_tts(*, call_id, text, timeout_sec):

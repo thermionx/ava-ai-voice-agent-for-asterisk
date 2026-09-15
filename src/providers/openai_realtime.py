@@ -902,7 +902,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         and self._operator_zero_question_input_item == self._latest_input_audio_item):
                     raise RuntimeError(
                         "Wait silently for the caller to answer the question you just asked. "
-                        "Do not repeat it or transfer yet. A brief answer or refusal is enough."
+                        "Do not repeat it or transfer yet. A broad reason is enough; if the caller refuses, offer voicemail."
                     )
             # A different routing request supersedes an analog ring-on-hangup request.
             if (getattr(self, "_context_name", None) == "operator_zero"

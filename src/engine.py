@@ -82,6 +82,7 @@ from .core.transport_orchestrator import TransportOrchestrator, TransportProfile
 from .core.models import CallSession
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
 from .core.operator_zero_state import OperatorZeroTransferState
+from .core.operator_zero_screening import ScreeningFacts
 from .core.call_audit.publisher import AuditPublisher, publish as publish_audit
 from .core.call_audit.ari import ARI_EVENTS as AUDIT_ARI_EVENTS
 from .core.outbound_schedule import normalize_outbound_daily_window
@@ -6906,12 +6907,12 @@ class Engine:
                 try:
                     if announcement_owner:
 
-                        spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(
-                            session
-                        )
-                        spoken_business_name = await self._operator_zero_extract_spoken_business_name(
-                            session
-                        )
+                        facts = ScreeningFacts.from_action(announcement_state.action)
+                        if facts is not None:
+                            spoken_caller_name, spoken_business_name = facts.caller_name, facts.company
+                        else:
+                            spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(session)
+                            spoken_business_name = await self._operator_zero_extract_spoken_business_name(session)
 
                         if spoken_caller_name:
                             session.caller_name = spoken_caller_name
@@ -6974,11 +6975,6 @@ class Engine:
                                         memory_identity.get("trusted_name") or ""
                                     ).strip().rstrip(".,;:!?")
 
-                                if not business_name:
-                                    business_name = str(
-                                        memory_identity.get("business_name") or ""
-                                    ).strip().rstrip(".,;:!?")
-
                                 logger.info(
                                     "Operator Zero predial stored caller identity",
                                     call_id=call_id,
@@ -6993,76 +6989,18 @@ class Engine:
                                 exc_info=True,
                             )
 
-                        # Prefer identity explicitly supplied by the AI with
-                        # blind_transfer. OpenAI may understand the caller
-                        # correctly even when no input transcript is emitted.
-                        call_reason = ""
-                        try:
-                            transfer_payload = (
-                                action.get("payload")
-                                if isinstance(action, dict)
-                                and isinstance(action.get("payload"), dict)
-                                else {}
-                            )
-                            transfer_identity = (
-                                transfer_payload.get("operator_zero")
-                                if isinstance(
-                                    transfer_payload.get("operator_zero"),
-                                    dict,
-                                )
-                                else {}
-                            )
-
-                            latest_for_identity = (
-                                await self.session_store.get_by_call_id(call_id)
-                                or session
-                            )
-                            latest_identity_action = dict(
-                                getattr(
-                                    latest_for_identity,
-                                    "current_action",
-                                    None,
-                                )
-                                or {}
-                            )
-
-                            supplied_name = str(
-                                transfer_identity.get("caller_name")
-                                or latest_identity_action.get("caller_name")
-                                or ""
-                            ).strip()
-
-                            supplied_business = str(
-                                transfer_identity.get("company")
-                                or latest_identity_action.get("business_name")
-                                or ""
-                            ).strip()
-
-                            if supplied_name:
-                                caller_name = supplied_name
-
-                            if supplied_business:
-                                business_name = supplied_business
-
-                            call_reason = str(
-                                transfer_identity.get("reason")
-                                or latest_identity_action.get("reason")
-                                or ""
-                            ).strip()
-
-                            if supplied_name or supplied_business:
-                                logger.info(
-                                    "Operator Zero predial using transfer-supplied identity",
-                                    call_id=call_id,
-                                    caller_name=caller_name or None,
-                                    business_name=business_name or None,
-                                )
-                        except Exception:
-                            logger.debug(
-                                "Operator Zero transfer-supplied identity lookup failed",
-                                call_id=call_id,
-                                exc_info=True,
-                            )
+                        # Persisted facts are authoritative for screened calls.
+                        # Legacy handoffs retain their existing payload/action fallback.
+                        if facts is None:
+                            payload = action.get("payload") or {}
+                            supplied = payload.get("operator_zero") or {}
+                            latest_session = await self.session_store.get_by_call_id(call_id) or session
+                            latest = dict(getattr(latest_session, "current_action", None) or {})
+                            caller_name = str(supplied.get("caller_name") or latest.get("caller_name") or caller_name).strip()
+                            business_name = str(supplied.get("company") or latest.get("business_name") or business_name).strip()
+                            call_reason = str(supplied.get("reason") or latest.get("reason") or "").strip()
+                        else:
+                            caller_name, business_name, call_reason = facts.caller_name, facts.company, facts.reason
 
                         if caller_name and business_name:
                             announcement_identity = (
@@ -7092,9 +7030,9 @@ class Engine:
 
                         first_admission = previous_acceptance_count == 0
 
-                        announcement_text = f"{announcement_identity} is on the line."
-                        if call_reason:
-                            announcement_text += f" Reason for calling: {call_reason}"
+                        announcement_text = (facts or ScreeningFacts(
+                            caller_name=caller_name, company=business_name, reason=call_reason
+                        )).announcement
 
                         logger.info(
                             "Operator Zero predial finalize private announcement",
@@ -9678,20 +9616,16 @@ class Engine:
 
             caller_number = str(getattr(session, "caller_number", "") or "").strip()
 
-            # Prefer the identity the caller actually gave Operator Zero.
-            spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(
-                session
-            )
+            facts = ScreeningFacts.from_action(dict(getattr(session, "current_action", None) or {}))
+            if facts is not None:
+                # The same caller-supported record produced the private announcement.
+                spoken_caller_name = facts.caller_name
+                spoken_business_name = facts.reason
+            else:
+                spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(session)
+                spoken_business_name = await self._operator_zero_extract_spoken_business_name(session)
 
-            spoken_business_name = await self._operator_zero_extract_spoken_business_name(
-                session
-            )
-
-            caller_id_name = str(
-                getattr(session, "caller_name", "") or ""
-            ).strip()
-
-            caller_name = spoken_caller_name or caller_id_name
+            caller_name = spoken_caller_name or str(getattr(session, "caller_name", "") or "").strip()
             business_name = spoken_business_name
 
             if spoken_caller_name:

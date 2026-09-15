@@ -16,10 +16,10 @@ class TestUnifiedTransferTool:
     @pytest.mark.parametrize("reason,spoken,expected_reason", [
         ("Tomorrow's lunch", "Tomorrow's lunch", "Tomorrow's lunch"),
         ("It's personal", "It's personal", "It's personal"),
-        ("", "I'd rather not say", ""),
-        ("collecting a payment", "I want to talk to Brian", ""),
+        ("I'm a friend", "I'm a friend", "I'm a friend"),
+        ("I want to talk to Brian", "I want to talk to Brian", "I want to talk to Brian"),
     ])
-    async def test_optional_reason_reaches_predial_announcement_only_when_spoken(
+    async def test_required_broad_reason_reaches_predial_announcement(
         self, tool, tool_context, mock_ari_client, reason, spoken, expected_reason
     ):
         tool_context.context_name = "operator_zero_incoming"
@@ -40,6 +40,7 @@ class TestUnifiedTransferTool:
         action = result[DEFERRED_TRANSFER_RESULT_KEY]
         assert action["payload"]["operator_zero"].get("reason", "") == expected_reason
         assert session.current_action["reason"] == expected_reason
+        assert session.current_action["screening_facts"]["reason"] == expected_reason
         await asyncio.sleep(0)
         text = "Bob is on the line."
         if expected_reason:
@@ -48,6 +49,25 @@ class TestUnifiedTransferTool:
             call_id=tool_context.call_id, text=text, timeout_sec=8.0
         )
         assert engine._operator_zero_predial_announcement_cache[tool_context.call_id]["text"] == text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason, spoken", [
+        ("", "I'm Bob, Brian please."),
+        ("collecting a payment", "I'm Bob calling for Brian."),
+        ("I'd rather not say", "I'm Bob calling for Brian. I'd rather not say."),
+    ])
+    async def test_missing_invented_or_refused_reason_never_rings(self, tool, tool_context, mock_ari_client, reason, spoken):
+        tool_context.context_name = "operator_zero_incoming"
+        session = tool_context.session_store.get_by_call_id.return_value
+        session.conversation_history = [{"role": "user", "content": spoken}]
+        tool_context.get_session = AsyncMock(return_value=session)
+        result = await tool.execute({"destination": "inside_phone", "caller_name": "Bob",
+                                     "recipient": "Brian", "reason": reason}, tool_context)
+        assert result["status"] == "failed"
+        assert result["screening_action"] == "ASK_REASON"
+        mock_ari_client.send_command.assert_not_awaited()
+        mock_ari_client.continue_in_dialplan.assert_not_awaited()
+        assert DEFERRED_TRANSFER_RESULT_KEY not in result
 
     @pytest.fixture
     def tool(self, mock_ari_client):
@@ -80,17 +100,17 @@ class TestUnifiedTransferTool:
         ]
 
         assert tool._validate_operator_zero_screening(
-            {"caller_name": "Bob", "recipient": "Lilian"}, history
+            {"caller_name": "Bob", "recipient": "Lilian", "reason": "calling for Lilian"}, history
         ) is None
 
     @pytest.mark.parametrize("surname", ["McGlothlen", "McGlothlin", "McGlothlan", "McLaughlin", "McLoughlin", "McLaughlan", "MacLachlan", "McLachlan", "McGloughlin", "MacGlothlen", "Mc Glothlen"])
     def test_operator_zero_accepts_household_surname_variants(self, tool, surname):
         history = [{"role": "user", "content": f"I am William {surname}, calling for Brian {surname}."}]
         assert tool._validate_operator_zero_screening(
-            {"caller_name": "William McGlothlen", "recipient": "Brian McGlothlen"}, history, name_aliases={"McGlothlen": [surname]}
+            {"caller_name": "William McGlothlen", "recipient": "Brian McGlothlen", "reason": "calling for Brian"}, history, name_aliases={"McGlothlen": [surname]}
         ) is None
         assert tool._validate_operator_zero_screening(
-            {"caller_name": f"William {surname}", "recipient": f"Brian {surname}"},
+            {"caller_name": f"William {surname}", "recipient": f"Brian {surname}", "reason": "calling for Brian"},
             [{"role": "user", "content": "William McGlothlen calling for Brian McGlothlen"}],
             name_aliases={"McGlothlen": [surname]},
         ) is None
@@ -109,7 +129,7 @@ class TestUnifiedTransferTool:
 
     def test_name_aliases_are_configured_and_match_whole_words(self, tool):
         history = [{"role": "user", "content": "Sam Smyth calling for Pat"}]
-        metadata = {"caller_name": "Sam Smith", "recipient": "Pat"}
+        metadata = {"caller_name": "Sam Smith", "recipient": "Pat", "reason": "calling for Pat"}
         assert tool._validate_operator_zero_screening(metadata, history) is not None
         assert tool._validate_operator_zero_screening(metadata, history, {"Smith": ["Smyth"]}) is None
         assert not tool._screening_value_was_spoken("Sam Smith", [
@@ -159,7 +179,7 @@ class TestUnifiedTransferTool:
         tool_context.config["tools"]["transfer"]["destinations"] = {
             "inside_phone": {"type": "extension", "target": "100"}
         }
-        arguments = {"destination": "inside_phone", "caller_name": "Sam Smith", "recipient": "Pat"}
+        arguments = {"destination": "inside_phone", "caller_name": "Sam Smith", "recipient": "Pat", "reason": "calling for Pat"}
         result = await tool.execute(arguments, tool_context)
         assert result["status"] == "failed"
         assert "identity" in result["message"]

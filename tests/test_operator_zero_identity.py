@@ -58,3 +58,31 @@ async def test_successful_call_directory_uses_identity_not_request_or_reason(eng
 async def test_business_requires_organization_context(engine, utterance, expected):
     session = SimpleNamespace(conversation_history=[{"role": "user", "content": utterance}])
     assert await engine._operator_zero_extract_spoken_business_name(session) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ["I'm a friend", 'we met once', 'I want to talk with Brian'])
+async def test_accepted_directory_uses_screened_reason_as_business(engine, monkeypatch, reason):
+    import json
+    from unittest.mock import Mock
+    from src.core.operator_zero_screening import ScreeningFacts
+    facts = ScreeningFacts('Alex', 'Brian', 'Acme Plumbing', reason)
+    session = SimpleNamespace(call_id='accepted', caller_number='15551234567', caller_name='Caller ID',
+                              current_action={'screening_facts': facts.to_metadata()}, conversation_history=[])
+    engine._operator_zero_extract_spoken_caller_name = AsyncMock(side_effect=AssertionError('do not re-extract'))
+    engine._operator_zero_extract_spoken_business_name = AsyncMock(side_effect=AssertionError('do not re-extract'))
+    engine._save_session = AsyncMock()
+    response = Mock(status=200)
+    response.read.return_value = b'{}'
+    from contextlib import contextmanager
+    requests = []
+    @contextmanager
+    def urlopen(request, timeout):
+        requests.append(json.loads(request.data))
+        yield response
+    monkeypatch.setattr('urllib.request.urlopen', urlopen)
+    await engine._operator_zero_mark_caller_trusted(session)
+    assert requests == [{'caller_number': '15551234567', 'caller_name': 'Alex', 'business_name': reason}]
+    engine._operator_zero_extract_spoken_caller_name.assert_not_awaited()
+    engine._operator_zero_extract_spoken_business_name.assert_not_awaited()
+    assert session.caller_name == 'Alex'

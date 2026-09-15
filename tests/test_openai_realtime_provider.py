@@ -641,7 +641,7 @@ async def test_operator_zero_transfer_waits_for_transcript_before_validation_and
 
     async def execute(event, provider_context):
         assert UnifiedTransferTool._validate_operator_zero_screening(
-            {"caller_name": "Bob", "recipient": "Brian"}, session.conversation_history
+            {"caller_name": "Bob", "recipient": "Brian", "reason": "looking for Brian"}, session.conversation_history
         ) is None
         await deferred_transfer.store_pending_deferred_transfer(context, {"id": "transfer-1", "kind": "transfer"})
         return {"status": "success"}
