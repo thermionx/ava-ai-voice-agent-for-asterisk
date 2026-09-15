@@ -82,6 +82,11 @@ class ScreeningFacts:
         return asdict(self)
 
     @property
+    def directory_business(self) -> str:
+        """Prefer the stated purpose; use the business when no purpose was supplied."""
+        return self.reason or self.company
+
+    @property
     def announcement(self) -> str:
         identity = self.caller_name or self.company or "The caller"
         if self.caller_name and self.company:
@@ -106,12 +111,14 @@ class ScreeningFacts:
                 return ScreeningDecision("ASK_CALLER", "The caller must identify themselves before a household transfer.")
             if not spoken(self.recipient, name=True):
                 return ScreeningDecision("ASK_RECIPIENT", "The named recipient was not stated by the caller.")
-            if not self.reason or not spoken(self.reason) or is_reason_refusal(self.reason):
+            has_reason = bool(self.reason) and spoken(self.reason) and not is_reason_refusal(self.reason)
+            has_business = bool(self.company) and spoken(self.company) and not is_reason_refusal(self.company)
+            if not (has_reason or has_business):
                 return ScreeningDecision(
                     "ASK_REASON",
-                    "A caller-stated reason is required before transferring. "
-                    "Ask what they are calling about if not already asked; accept a broad reason or relationship. "
-                    "If they refuse, offer voicemail instead of transferring.",
+                    "A caller-stated business name or reason is required before transferring. "
+                    "Ask what they are calling about only if neither is known; deliveries, appointments, and relationships suffice. "
+                    "If they provide neither, offer voicemail instead of transferring.",
                 )
             return ScreeningDecision("TRANSFER")
 
@@ -120,7 +127,7 @@ class ScreeningFacts:
                           "hospital", "doctor", "medical", "court", "government", "emergency services"}
         company = " ".join(self.company.lower().replace("_", " ").replace("-", " ").split())
         if (any(term in company for term in official_terms) and self.reason
-                and spoken(self.company) and spoken(self.reason)):
+                and spoken(self.company) and spoken(self.reason) and not is_reason_refusal(self.reason)):
             return ScreeningDecision("TRANSFER")
         return ScreeningDecision("ASK_RECIPIENT", "A specific named recipient or a confirmed emergency/official reason is required.")
 
@@ -130,7 +137,7 @@ def is_reason_refusal(reason: str) -> bool:
     normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", reason.lower()).split())
     return bool(re.fullmatch(
         r"(?:no|none|no reason|nothing|unknown|not provided|not given|declined|refused|"
-        r"(?:i )?(?:would |d )?rather not(?: say| tell you| give a reason)?(?: why)?|"
+        r"(?:i )?(?:would |d )?rather not(?: say| tell you| give a reason)?(?: why| more)?|"
         r"i (?:don t|do not|won t|will not) (?:want to )?(?:say|tell you|give a reason)|"
         r"none of your business)"
         r"(?: please)?(?: (?:please )?(?:just )?(?:connect me|put me through))?",

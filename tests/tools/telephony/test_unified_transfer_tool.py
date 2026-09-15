@@ -69,6 +69,30 @@ class TestUnifiedTransferTool:
         mock_ari_client.continue_in_dialplan.assert_not_awaited()
         assert DEFERRED_TRANSFER_RESULT_KEY not in result
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["", "I'd rather not say", "invented appointment"])
+    async def test_business_without_reason_reaches_handoff_without_fabricated_details(self, tool, tool_context, mock_ari_client, reason):
+        tool_context.context_name = "operator_zero_incoming"
+        session = tool_context.session_store.get_by_call_id.return_value
+        session.conversation_history = [{"role": "user", "content": "I'm Alex from Acme Plumbing. Brian, please. I'd rather not say."}]
+        tool_context.get_session = AsyncMock(return_value=session)
+        engine = Mock()
+        engine._local_ai_server_tts = AsyncMock(return_value=b"audio")
+        engine._operator_zero_predial_announcement_cache = {}
+        mock_ari_client.engine = engine
+        tool_context.config["tools"]["transfer"] = {
+            "deferred_strategy": "predial_then_bridge",
+            "destinations": {"inside_phone": {"type": "extension", "target": "100"}},
+        }
+        result = await tool.execute({"destination": "inside_phone", "caller_name": "Alex", "recipient": "Brian",
+                                     "company": "Acme Plumbing", "reason": reason}, tool_context)
+        assert result["status"] == "success"
+        assert session.current_action["screening_facts"] == {
+            "caller_name": "Alex", "recipient": "Brian", "company": "Acme Plumbing", "reason": ""}
+        await asyncio.sleep(0)
+        engine._local_ai_server_tts.assert_awaited_once_with(
+            call_id=tool_context.call_id, text="Alex from Acme Plumbing is on the line.", timeout_sec=8.0)
+
     @pytest.fixture
     def tool(self, mock_ari_client):
         mock_ari_client.dialplan_target_exists = AsyncMock(return_value=True)

@@ -28,7 +28,7 @@ def test_name_and_recipient_require_a_broad_caller_stated_reason():
     assert UnifiedTransferTool._validate_operator_zero_screening(
         {"caller_name": "Bob", "recipient": "Brian", "reason": "I need Brian"}, history
     ) is None
-    assert "reason is required" in UnifiedTransferTool._validate_operator_zero_screening(
+    assert "business name or reason is required" in UnifiedTransferTool._validate_operator_zero_screening(
         {"caller_name": "Bob", "recipient": "Brian", "reason": ""}, history
     )
 

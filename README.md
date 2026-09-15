@@ -1480,22 +1480,24 @@ code must enforce the telephone lifecycle.
 ### Shared incoming screening facts
 
 Ordinary Operator Zero screening requires the caller's personal name, a named
-recipient, and a broad caller-stated reason. “I want to talk with Brian,” “I'm a
-friend,” and “we met once” are sufficient. The prompt asks only for missing facts,
-waits for a reply, and offers voicemail when the caller refuses a reason. These
+recipient, and either a caller-stated business name or a broad reason. “I want to talk with Brian,” “I'm a
+friend,” and “we met once” are sufficient. Deliveries and appointments need no business name; a business
+name alone needs no separate reason. The prompt asks only for missing facts,
+waits for a reply, and offers voicemail when neither detail is supplied. These
 examples guide conversation; they are not an allowlist of acceptable reasons.
 
 [`ScreeningFacts`](src/core/operator_zero_screening.py) centralizes transcript
 evidence checks and the next-action decision. The transfer tool persists one
 screening record for prepared/final announcements and directory learning. One
 formatter produces both announcement versions. The reason is saved in directory
-**Business** after acceptance and connection; company remains a separate optional
+**Business** after acceptance and connection, falling back to the business name
+when no reason was supplied; company remains a separate optional
 announcement field. A saved Business value is not reused as a caller's employer.
 Provider code still enforces audio-turn ordering, and the existing transfer state
 machine still controls completed playback, bridging, and trust.
 
-This change was **deployed September 14, 2026 at 22:34 Pacific**, with the engine
-and revised incoming Agent prompt updated together. Runtime checks passed;
+The shared-facts foundation was deployed September 14 at 22:34 Pacific. The
+business-or-reason clarification is validated locally and awaiting deployment;
 physical-phone verification remains outstanding. YAML alone does not update the active Agent.
 See the [screening change record](https://github.com/thermionx/operator-zero/blob/main/docs/screening-simplification.md)
 and [household user manual](https://github.com/thermionx/operator-zero/blob/main/docs/user-manual/Operator-Zero-User-Manual.pdf).

@@ -18,7 +18,7 @@ from .deferred_transfer import (
     transfer_deferral_enabled,
 )
 from ...core.operator_zero_state import OperatorZeroTransferState
-from ...core.operator_zero_screening import ScreeningFacts, value_was_spoken
+from ...core.operator_zero_screening import ScreeningFacts, value_was_spoken, is_reason_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -74,7 +74,8 @@ class UnifiedTransferTool(Tool):
                     description=(
                         "Company, organization, emergency service, hospital, "
                         "police/fire department, or other organization the "
-                        "caller identified, when known."
+                        "caller identified, when known. For ordinary Operator Zero calls, "
+                        "a business name is sufficient without a separate reason."
                     ),
                     required=False
                 ),
@@ -92,10 +93,11 @@ class UnifiedTransferTool(Tool):
                     type="string",
                     description=(
                         "Caller's stated reason for calling, in their own words, "
-                        "for the private announcement and directory Business field. Required "
-                        "for Operator Zero incoming calls. Broad reasons such as "
-                        "I want to talk with Brian, I am a friend, or we met once "
-                        "are sufficient. A refusal is not a reason."
+                        "for the private announcement and directory Business field. Ordinary "
+                        "Operator Zero calls need either company or reason, not both. "
+                        "Deliveries, appointments, relationships, and requests to talk "
+                        "are sufficient reasons without a business name. A refusal is not a reason. "
+                        "The no-recipient official-service exception still requires a concrete purpose."
                     ),
                     required=False
                 )
@@ -579,9 +581,12 @@ class UnifiedTransferTool(Tool):
                 return {"status": "failed", "message": decision.message,
                         "screening_action": decision.action,
                         "next_action": decision.message + " Do not retry unchanged facts. Offer voicemail if the caller declines."}
-            # Company remains a separate organization claim; Business stores reason.
-            if facts.company and not value_was_spoken(facts.company, history):
-                screening_metadata.pop("company", None)
+            # A valid business can admit the call even if no usable reason was
+            # supplied. Never carry invented or refused details into the announcement.
+            for key in ("company", "reason"):
+                value = screening_metadata.get(key, "")
+                if value and (not value_was_spoken(value, history) or is_reason_refusal(value)):
+                    screening_metadata.pop(key)
         
         # Get destinations from config via context
         config = context.get_config_value("tools.transfer") or {}

@@ -176,3 +176,15 @@ preserved. Only `ai_engine` restarted after a zero-call check; ARI registration,
 runtime prompt/greeting/tool checks, mocked Business learning, and startup error
 checks passed. Backup: `/home/brian/deployment-backups/required-reason-20260915-053211`.
 See the companion change record for rollback and outstanding handset checks.
+
+
+### Latest clarification: business OR reason (deployment pending)
+
+Brian clarified that a business name or a reason is enough for ordinary calls.
+Deliveries and appointments qualify without a business. Personal caller and
+recipient names remain required. Business saves the reason when supplied,
+otherwise the business name. The official exception without a named recipient
+still needs service identity and purpose. Local regression: 2669 passed,
+11 skipped, the known baseline cancellation failure. Eight directory tests pass.
+README, manual revision 1.2, and source/recovery prompts are synchronized.
+See docs/screening-simplification.md for files, deployment, and phone checks.

@@ -9620,7 +9620,7 @@ class Engine:
             if facts is not None:
                 # The same caller-supported record produced the private announcement.
                 spoken_caller_name = facts.caller_name
-                spoken_business_name = facts.reason
+                spoken_business_name = facts.directory_business
             else:
                 spoken_caller_name = await self._operator_zero_extract_spoken_caller_name(session)
                 spoken_business_name = await self._operator_zero_extract_spoken_business_name(session)

@@ -61,7 +61,7 @@ async def test_business_requires_organization_context(engine, utterance, expecte
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reason', ["I'm a friend", 'we met once', 'I want to talk with Brian'])
+@pytest.mark.parametrize('reason', ["I'm a friend", 'we met once', 'I want to talk with Brian', '', 'a delivery', 'an appointment'])
 async def test_accepted_directory_uses_screened_reason_as_business(engine, monkeypatch, reason):
     import json
     from unittest.mock import Mock
@@ -82,7 +82,7 @@ async def test_accepted_directory_uses_screened_reason_as_business(engine, monke
         yield response
     monkeypatch.setattr('urllib.request.urlopen', urlopen)
     await engine._operator_zero_mark_caller_trusted(session)
-    assert requests == [{'caller_number': '15551234567', 'caller_name': 'Alex', 'business_name': reason}]
+    assert requests == [{'caller_number': '15551234567', 'caller_name': 'Alex', 'business_name': reason or 'Acme Plumbing'}]
     engine._operator_zero_extract_spoken_caller_name.assert_not_awaited()
     engine._operator_zero_extract_spoken_business_name.assert_not_awaited()
     assert session.caller_name == 'Alex'
